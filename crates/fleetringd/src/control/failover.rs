@@ -191,7 +191,8 @@ impl Sweep {
             SubmitError::Stopped | SubmitError::Storage(_) => Self::Stop,
             SubmitError::NotLeader { .. }
             | SubmitError::CatchingUp { .. }
-            | SubmitError::Superseded => Self::Pause,
+            | SubmitError::Superseded
+            | SubmitError::Unknown => Self::Pause,
             SubmitError::Refused(_) => Self::Continue,
         }
     }
@@ -280,7 +281,8 @@ pub(crate) fn expired(database: &DatabaseName, result: Result<Committed, SubmitE
         Err(
             error @ (SubmitError::NotLeader { .. }
             | SubmitError::CatchingUp { .. }
-            | SubmitError::Superseded),
+            | SubmitError::Superseded
+            | SubmitError::Unknown),
         ) => {
             tracing::debug!(database = %database, %error, "the expiry wasn't logged; the next leader sweeps again");
             return Sweep::Pause;
@@ -459,7 +461,8 @@ async fn drive_forks(handle: &ControlHandle, leader: LeaderRef, now: Timestamp) 
             Err(
                 SubmitError::NotLeader { .. }
                 | SubmitError::CatchingUp { .. }
-                | SubmitError::Superseded,
+                | SubmitError::Superseded
+                | SubmitError::Unknown,
             ) => return Sweep::Pause,
         }
     }
@@ -505,7 +508,8 @@ async fn release_kept_replicas(handle: &ControlHandle, leader: LeaderRef) -> Swe
             Ok(Err(
                 SubmitError::NotLeader { .. }
                 | SubmitError::CatchingUp { .. }
-                | SubmitError::Superseded,
+                | SubmitError::Superseded
+                | SubmitError::Unknown,
             )) => sweep = sweep.and(Sweep::Pause),
             Err(error) => {
                 tracing::warn!(%error, "a release's submission ended early; the next tick proposes again");
@@ -1167,6 +1171,7 @@ mod tests {
             SubmitError::NotLeader { leader: None },
             SubmitError::CatchingUp { leader: None },
             SubmitError::Superseded,
+            SubmitError::Unknown,
         ] {
             assert_eq!(Sweep::after(&paused), Sweep::Pause, "{paused:?}");
         }

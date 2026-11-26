@@ -12,11 +12,17 @@
 //!
 //! Every proposal carries the leader it was screened under, in its entry and as openraft's
 //! expected leader, so an entry that a later leader appends anyway is skipped by every state
-//! machine alike. Proposals pipeline: the proposer doesn't wait for one to apply before it
-//! screens the next, and the commands queued together go to openraft as one batch, appended with
-//! one sync.
+//! machine alike. The commands queued together go to openraft as one batch, appended with one
+//! sync, and one batch is in flight at a time: the proposer screens the next batch only once
+//! openraft has answered every proposal of the previous one (ADR-0040, amendment 1). openraft
+//! refuses a write on a leader whose lease has expired while that leader stays leader in the same
+//! term, so a batch screened before an earlier batch's answer arrived could be screened against a
+//! state holding a command that never took effect. Submissions keep queuing in the mailbox
+//! meanwhile, and form the next batch.
 
 use std::sync::Arc;
+#[cfg(test)]
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use fleetring::NodeId;
@@ -29,7 +35,7 @@ use openraft::impls::leader_id_adv::LeaderId;
 use openraft::rt::watch::WatchReceiver;
 use openraft::type_config::alias::{WatchReceiverOf, WriteResponderOf};
 use openraft::{RaftMetrics, ServerState};
-use tokio::sync::{mpsc, oneshot, watch};
+use tokio::sync::{Notify, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 
 use crate::clock::Clock;
@@ -148,6 +154,10 @@ pub(crate) struct Faults {
     /// How many proposals to screen under another term than the one they're written in, so the
     /// state machine supersedes them, as it would an entry a truncation left in another term.
     pub(crate) supersede: AtomicUsize,
+    /// Whether waiters hold their answers back until `release` is notified.
+    pub(crate) hold: AtomicBool,
+    /// Lets held answers go.
+    pub(crate) release: Notify,
 }
 
 /// Takes one from `counter`, if it isn't zero.
@@ -176,6 +186,8 @@ pub(crate) struct Proposer {
     fork_limits: Option<ForkLimits>,
     metrics: ControlMetrics,
     in_flight: Arc<AtomicUsize>,
+    /// Notified each time a proposal stops counting as in flight.
+    answered: Arc<Notify>,
     screening: Option<Screening>,
     /// The last generation handed out.
     generations: u64,
@@ -219,6 +231,7 @@ impl Proposer {
         applied: watch::Receiver<AppliedState>,
         metrics: ControlMetrics,
         inbox: mpsc::Receiver<Mail>,
+        stopping: watch::Receiver<bool>,
     ) -> Running {
         let (readiness, readiness_receiver) = watch::channel(Readiness::Follower { leader: None });
         let in_flight = Arc::new(AtomicUsize::new(0));
@@ -236,13 +249,14 @@ impl Proposer {
             fork_limits: settings.fork_limits,
             metrics,
             in_flight: Arc::clone(&in_flight),
+            answered: Arc::new(Notify::new()),
             screening: None,
             generations: 0,
             poisoned: Arc::new(AtomicU64::new(0)),
             #[cfg(test)]
             faults: Arc::clone(&faults),
         };
-        let task = tokio::spawn(proposer.run(inbox, applied));
+        let task = tokio::spawn(proposer.run(inbox, applied, stopping));
         Running {
             readiness: readiness_receiver,
             in_flight,
@@ -256,10 +270,15 @@ impl Proposer {
         mut self,
         mut inbox: mpsc::Receiver<Mail>,
         mut applied: watch::Receiver<AppliedState>,
+        mut stopping: watch::Receiver<bool>,
     ) {
         let mut raft_metrics = self.raft.metrics();
         self.refresh(&raft_metrics, &applied);
         loop {
+            // One batch in flight: while a ready leader waits for openraft to answer a proposal,
+            // submissions wait in the mailbox. A node that isn't a ready leader screens nothing,
+            // so it answers them at once, whatever it still waits for.
+            let taking = self.in_flight.load(Ordering::SeqCst) == 0 || self.screening.is_none();
             tokio::select! {
                 biased;
                 changed = raft_metrics.changed() => {
@@ -274,7 +293,13 @@ impl Proposer {
                     }
                     self.refresh(&raft_metrics, &applied);
                 }
-                mail = inbox.recv() => {
+                () = self.answered.notified(), if !taking => {}
+                // A stop request queued behind waiting submissions can't be read yet, so a
+                // shutdown also says so here; stopping the group then answers what is in flight.
+                Ok(()) = async { stopping.wait_for(|stop| *stop).await.map(drop) }, if !taking => {
+                    break;
+                }
+                mail = inbox.recv(), if taking => {
                     let Some(first) = mail else { break };
                     let (batch, stop) = gather(first, &mut inbox);
                     if !batch.is_empty() {
@@ -289,6 +314,19 @@ impl Proposer {
             }
         }
         self.stop().await;
+        // What still waits in the mailbox is answered `Stopped`, and a stop request among it is
+        // told the proposer has stopped.
+        inbox.close();
+        while let Some(mail) = inbox.recv().await {
+            match mail {
+                Mail::Submit { reply, .. } => {
+                    let _unheard = reply.send(Err(SubmitError::Stopped));
+                }
+                Mail::Stop { done } => {
+                    let _unheard = done.send(());
+                }
+            }
+        }
     }
 
     async fn stop(&mut self) {
@@ -374,22 +412,23 @@ impl Proposer {
         }
     }
 
-    /// Whether the screening state can be screened against: it exists, and no proposal made
-    /// from it was answered other than `Applied`. A poisoned state is cloned again from the
-    /// applied state once every proposal in flight has been answered, since only then does the
-    /// applied state hold exactly what took effect.
+    /// Whether the screening state can be screened against: it exists. A screening state that a
+    /// proposal answered other than `Applied` poisoned is cloned again from the applied state
+    /// first: with one batch in flight, every proposal made from it has been answered by then,
+    /// so the applied state holds exactly what took effect.
     fn usable(&mut self, applied: &watch::Receiver<AppliedState>) -> bool {
         let poisoned = self.poisoned.load(Ordering::SeqCst);
-        let in_flight = self.in_flight.load(Ordering::SeqCst);
         let Some(screening) = self.screening.as_mut() else {
             return false;
         };
         if poisoned != screening.generation {
             return true;
         }
-        if in_flight > 0 {
-            return false;
-        }
+        debug_assert_eq!(
+            self.in_flight.load(Ordering::SeqCst),
+            0,
+            "a batch was taken while another was in flight"
+        );
         self.generations += 1;
         screening.state = State::clone(&applied.borrow().state);
         screening.last = None;
@@ -408,11 +447,7 @@ impl Proposer {
         applied: &watch::Receiver<AppliedState>,
     ) {
         if !self.usable(applied) {
-            // Not leading, or a proposal didn't take effect and some are still in flight.
-            let readiness = match self.readiness.borrow().clone() {
-                Readiness::Ready { leader } => Readiness::CatchingUp { term: leader.term },
-                other => other,
-            };
+            let readiness = self.readiness.borrow().clone();
             for (_, _, reply) in batch {
                 let _unheard = reply.send(Err(readiness.refusal(&self.peer)));
             }
@@ -428,6 +463,7 @@ impl Proposer {
         let waiter = Waiter {
             metrics: self.metrics.clone(),
             in_flight: Arc::clone(&self.in_flight),
+            answered: Arc::clone(&self.answered),
             poisoned: Arc::clone(&self.poisoned),
             generation: screening.generation,
             #[cfg(test)]
@@ -530,6 +566,8 @@ fn gather(
 struct Waiter {
     metrics: ControlMetrics,
     in_flight: Arc<AtomicUsize>,
+    /// Notified once a proposal stops counting as in flight.
+    answered: Arc<Notify>,
     /// Set to `generation` when a proposal is answered other than `Applied`.
     poisoned: Arc<AtomicU64>,
     /// The generation of the screening state the proposals were screened against.
@@ -580,7 +618,12 @@ impl Waiter {
         self.in_flight.fetch_add(1, Ordering::SeqCst);
         let waiter = self.clone();
         tokio::spawn(async move {
-            let answer = match answered.await {
+            let answered = answered.await;
+            #[cfg(test)]
+            if waiter.faults.hold.load(Ordering::SeqCst) {
+                waiter.faults.release.notified().await;
+            }
+            let answer = match answered {
                 Err(_) => Err(SubmitError::Stopped),
                 Ok(Ok(response)) => match response.data {
                     ControlResponse::Applied { outcome, state } => Ok(Committed::new(
@@ -593,12 +636,14 @@ impl Waiter {
                         Err(SubmitError::Superseded)
                     }
                 },
-                Ok(Err(
-                    ClientWriteError::ForwardToLeader(forward)
-                    | ClientWriteError::LogEntryDiscarded(forward),
-                )) => Err(SubmitError::NotLeader {
-                    leader: forward.leader_node.map(|peer| peer.address),
-                }),
+                Ok(Err(ClientWriteError::ForwardToLeader(forward))) => {
+                    Err(SubmitError::NotLeader {
+                        leader: forward.leader_node.map(|peer| peer.address),
+                    })
+                }
+                // Truncated by a later leader, or purged behind a snapshot: another leader may
+                // still commit it, so its outcome is unknown (ADR-0040, amendment 1).
+                Ok(Err(ClientWriteError::LogEntryDiscarded(_))) => Err(SubmitError::Unknown),
                 Ok(Err(
                     ClientWriteError::ChangeMembershipError(_)
                     | ClientWriteError::PreconditionFailed(_),
@@ -607,7 +652,7 @@ impl Waiter {
             let outcome = match &answer {
                 Ok(_) => Some("committed"),
                 Err(SubmitError::Superseded) => Some("superseded"),
-                Err(SubmitError::NotLeader { .. }) => Some("not_leader"),
+                Err(SubmitError::NotLeader { .. } | SubmitError::Unknown) => Some("not_leader"),
                 Err(
                     SubmitError::Stopped
                     | SubmitError::Storage(_)
@@ -629,6 +674,7 @@ impl Waiter {
                 let _unheard = reply.send(answer);
             }
             waiter.in_flight.fetch_sub(1, Ordering::SeqCst);
+            waiter.answered.notify_one();
             // Last, so a resend waiting on this entry is answered after its submitter.
             drop(done);
         });
@@ -1048,9 +1094,9 @@ mod tests {
     }
 
     /// A proposal answered other than `Applied` leaves the screening state holding a command
-    /// that took no effect. The proposer refuses as catching up while proposals are in flight,
-    /// then screens from the applied state again: a join two release lines from a join that was
-    /// superseded is accepted, as the log holds no trace of the first.
+    /// that took no effect. The proposer screens the next batch from the applied state again: a
+    /// join two release lines from a join that was superseded is accepted, as the log holds no
+    /// trace of the first.
     #[tokio::test(start_paused = true)]
     async fn a_proposal_that_takes_no_effect_resets_the_screening_state() {
         let dir = tempfile::tempdir().expect("a directory");
@@ -1066,6 +1112,53 @@ mod tests {
             .submit(join("far", Release::new(0, 11, 0)))
             .await
             .expect("commits");
+        assert!(second.outcome().is_ok(), "{:?}", second.outcome());
+        node.shutdown().await;
+        let joined: Vec<String> = logged_commands(&path)
+            .into_iter()
+            .filter_map(|command| match command.action {
+                Action::Join { member } => Some(member.id().to_string()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(joined, ["far"]);
+    }
+
+    /// A batch submitted while a proposal that takes no effect is still in flight waits in the
+    /// mailbox until that proposal is answered, and is then screened against the state cloned
+    /// again from the applied state, not against the screening state that held the command
+    /// (ADR-0040, amendment 1): a join two release lines from the superseded join is accepted.
+    #[tokio::test(start_paused = true)]
+    async fn a_batch_behind_a_refused_proposal_is_screened_against_the_applied_state() {
+        let dir = tempfile::tempdir().expect("a directory");
+        let path = dir.path().join("control.db");
+        let node = open_node(&path, options(), SimClock::new(Timestamp::ZERO))
+            .await
+            .expect("opens");
+        let handle = node.handle();
+        handle.faults().supersede.store(1, Ordering::SeqCst);
+        handle.faults().hold.store(true, Ordering::SeqCst);
+        let first = {
+            let handle = handle.clone();
+            tokio::spawn(async move { handle.submit(join("old", Release::new(0, 9, 0))).await })
+        };
+        while handle.in_flight() == 0 {
+            tokio::task::yield_now().await;
+        }
+        let second = {
+            let handle = handle.clone();
+            tokio::spawn(async move { handle.submit(join("far", Release::new(0, 11, 0))).await })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(
+            !second.is_finished(),
+            "the second batch waits for the first's answer"
+        );
+        handle.faults().hold.store(false, Ordering::SeqCst);
+        handle.faults().release.notify_one();
+        let first = first.await.expect("joins");
+        assert!(matches!(first, Err(SubmitError::Superseded)), "{first:?}");
+        let second = second.await.expect("joins").expect("commits");
         assert!(second.outcome().is_ok(), "{:?}", second.outcome());
         node.shutdown().await;
         let joined: Vec<String> = logged_commands(&path)

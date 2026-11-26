@@ -304,6 +304,12 @@ pub enum SubmitError {
     /// names another node, so every state machine skipped it. Nothing changed.
     #[error("the control leader changed before the command was logged; retry")]
     Superseded,
+    /// openraft discarded the entry from this node's log, truncated by a later leader or purged
+    /// behind a snapshot, before its outcome was known here. Another leader may still have
+    /// committed it, so whether it took effect is unknown; a retry is safe, since the next leader
+    /// screens it against the state its log reaches (ADR-0040, amendment 1).
+    #[error("the control leader changed before the command was known to be logged; retry")]
+    Unknown,
 }
 
 /// A command that was logged and applied, or a resend of a delegation the log already records,
@@ -434,8 +440,9 @@ impl ControlHandle {
     ///
     /// [`SubmitError`] if the node has stopped or can't log the command, refused it before
     /// logging it, isn't the ready leader ([`SubmitError::NotLeader`],
-    /// [`SubmitError::CatchingUp`]), or lost leadership before the entry took effect
-    /// ([`SubmitError::Superseded`]). A command the state machine rejects is otherwise not an
+    /// [`SubmitError::CatchingUp`]), lost leadership before the entry took effect
+    /// ([`SubmitError::Superseded`]), or lost it before the entry's outcome was known
+    /// ([`SubmitError::Unknown`]). A command the state machine rejects is otherwise not an
     /// error here: it is logged, and its [`Committed::outcome`] holds the rejection. The
     /// exception is a command that needs the `delegation` fleet feature, whose rejection is
     /// [`SubmitError::Refused`] and is never logged (ADR-0047, point 6.2); and a resend of a
@@ -610,6 +617,12 @@ impl ControlHandle {
         self.raft.as_ref().expect("the node runs its group")
     }
 
+    /// How many proposals wait for openraft's answer, for tests.
+    #[cfg(test)]
+    pub(crate) fn in_flight(&self) -> usize {
+        self.in_flight.load(Ordering::SeqCst)
+    }
+
     /// The faults a test injects into the proposer.
     #[cfg(test)]
     pub(crate) fn faults(&self) -> &crate::control::raft::proposer::Faults {
@@ -625,6 +638,8 @@ pub struct ControlNode {
     #[cfg_attr(not(test), expect(dead_code, reason = "the tests count its appends"))]
     log: RaftLog,
     tasks: Vec<JoinHandle<()>>,
+    /// Tells the proposer to stop even while it waits for a batch to be answered.
+    stopping: watch::Sender<bool>,
 }
 
 /// What a control node found when it opened its log.
@@ -721,6 +736,7 @@ impl ControlNode {
     /// Commands submitted after this fail with [`SubmitError::Stopped`]. State watchers see their
     /// streams end.
     pub async fn shutdown(self) {
+        self.stopping.send_replace(true);
         let (done, stopped) = oneshot::channel();
         if self.handle.mailbox.send(Mail::Stop { done }).await.is_ok() {
             // An error means the proposer already exited, which is what shutdown wants.
@@ -815,6 +831,7 @@ impl Opening {
                 recovered: found.summary,
                 log,
                 tasks: Vec::new(),
+                stopping: watch::channel(false).0,
             });
         }
         let raft = ControlRaft::new(
@@ -857,6 +874,7 @@ impl Opening {
             return Err(OpenError::Raft(Box::new(error)));
         }
         let (mailbox, inbox) = mpsc::channel(options.mailbox.get());
+        let (stopping, stopping_receiver) = watch::channel(false);
         let running = Proposer::spawn(
             raft.clone(),
             clock,
@@ -872,6 +890,7 @@ impl Opening {
             published.applied.clone(),
             metrics.clone(),
             inbox,
+            stopping_receiver,
         );
         let watcher = tokio::spawn(watch_metrics(raft.clone(), metrics));
         if alone {
@@ -918,6 +937,7 @@ impl Opening {
             recovered,
             log,
             tasks: vec![running.task, watcher],
+            stopping,
         })
     }
 }
