@@ -58,12 +58,13 @@ impl Settings {
 /// The group gate's check of a command before it is logged (ADR-0040 point 4): whether every
 /// member of the control group supports the fleet features it needs.
 pub(crate) trait Gate {
-    /// Refuses `action` if a member of the group doesn't support a feature it needs.
+    /// Refuses `action`, screened against `state`, if it is the first use of a feature a member
+    /// of the group doesn't support, or a join a member's release can't run beside.
     ///
     /// # Errors
     ///
     /// The [`Rejection`] to answer.
-    fn check(&self, action: &Action) -> Result<(), Rejection>;
+    fn check(&self, action: &Action, state: &State) -> Result<(), Rejection>;
 }
 
 /// A gate that admits everything: a log with no control group beyond the fleet's members.
@@ -73,7 +74,7 @@ pub(crate) struct Open;
 
 #[cfg(test)]
 impl Gate for Open {
-    fn check(&self, _action: &Action) -> Result<(), Rejection> {
+    fn check(&self, _action: &Action, _state: &State) -> Result<(), Rejection> {
         Ok(())
     }
 }
@@ -199,7 +200,7 @@ impl<'s> Screen<'s> {
             if needs_screening(&action)
                 && let Err(rejection) = preview
                     .check_admission(&action)
-                    .and_then(|()| gate.check(&action))
+                    .and_then(|()| gate.check(&action, preview))
             {
                 return Screened {
                     enabling: None,
@@ -225,7 +226,7 @@ impl<'s> Screen<'s> {
                 None
             };
             if let Some(enable) = enable {
-                match gate.check(&enable) {
+                match gate.check(&enable, preview) {
                     Ok(()) => {
                         let command = settings.stamp(at, enable);
                         let _outcome = apply(preview, command.clone());
@@ -563,7 +564,7 @@ mod tests {
     struct Lacking(Feature);
 
     impl Gate for Lacking {
-        fn check(&self, action: &Action) -> Result<(), Rejection> {
+        fn check(&self, action: &Action, _state: &State) -> Result<(), Rejection> {
             if action.features().contains(&self.0) {
                 Err(Rejection::FeatureUnsupported {
                     feature: self.0,

@@ -1,0 +1,17 @@
+{
+  "node_id": "c3",
+  "software": {
+    "release": "0.10.0",
+    "control_format": 2,
+    "newer_features": [
+      "delegation",
+      "handover"
+    ]
+  },
+  "has_raft_state": false,
+  "genesis": {
+    "lease_duration": 4000,
+    "failover_margin": 2000,
+    "heartbeat_timeout": 5000
+  }
+}

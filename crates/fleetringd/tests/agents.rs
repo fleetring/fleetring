@@ -1588,9 +1588,10 @@ impl StubFleet {
         })
     }
 
-    /// A fleet whose one member runs 0.7.2, which doesn't report `delegation`.
+    /// A fleet whose one member runs 0.8.0 without `delegation`: a release within the control
+    /// node's window, which counts the control node itself (ADR-0040 point 4).
     async fn lacking() -> TestResult<Self> {
-        Self::start(Software::new(Release::new(0, 7, 2), 1)).await
+        Self::start(Software::new(Release::new(0, 8, 0), 1)).await
     }
 
     /// A fleet whose one member reports `delegation`.
@@ -1603,7 +1604,7 @@ impl StubFleet {
 fn lacking_note(id: &str) -> String {
     format!(
         "note: agent {id} can delegate after `fleetring agent renew {id}` once every node runs \
-         0.8; node 'data-1' runs fleetringd 0.7.2, which doesn't report the delegation feature"
+         0.8; node 'data-1' runs fleetringd 0.8.0, which doesn't report the delegation feature"
     )
 }
 

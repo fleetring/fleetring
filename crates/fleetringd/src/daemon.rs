@@ -16,6 +16,7 @@ use crate::auth::{AuthLayer, Authorizer};
 use crate::changes::{BuildSinkError, ChangeParts, ChangeSettings, ChangeStreams, build_sink};
 use crate::config::{HEARTBEATS_PER_TIMEOUT, reachable};
 use crate::control::raft::ControlPeer;
+use crate::control::raft::service::RaftService;
 use crate::control::{
     ControlClient, ControlHandle, ControlNode, ControlOptions, ControlService, Failover,
     FailoverSettings, NoControl, OpenError,
@@ -37,6 +38,7 @@ use crate::tls::{
 };
 use crate::transport::{
     AcceptLoop, Listener, Peers, control_server, database_server, incoming_and_accept_loop,
+    raft_server,
 };
 use crate::{
     AdminListener, AdminPlaintext, AdminTls, Config, ConfigError, DataDir, DataDirError,
@@ -317,10 +319,11 @@ impl Daemon {
                     .with_fork_faults(environment.fork_faults())
                     .with_dev_mode(config.dev)
                     .with_network(network.clone());
-                match &role.issuer {
+                let service = match &role.issuer {
                     Some((pair, _)) => service.with_issuer(pair.clone()),
                     None => service,
-                }
+                };
+                (service, role.node.raft_service())
             }),
             data.as_ref().map(|(_, node)| node),
             control_address(&config, address),
@@ -705,7 +708,8 @@ async fn open_control(
         .with_raft_heartbeat(Duration::from_millis(control.raft_heartbeat_ms.get()))
         .with_log_keep(control.log_keep)
         .with_snapshots_retained(snapshots_retained)
-        .with_fork_limits(config.fork.limits());
+        .with_fork_limits(config.fork.limits())
+        .with_software(environment.software());
     let path = data_dir.path().join(CONTROL_DB);
     Ok(ControlNode::open_with_metrics(
         path,
@@ -1010,13 +1014,13 @@ struct Guard {
     authorizer: Authorizer,
 }
 
-/// Serves on `listener`, guarded by `guard`: the `Control` service if `control` runs here, and the `Database` and `Replication` services if `data`
-/// does. A node without the control role answers control calls with [`NoControl`], which names
+/// Serves on `listener`, guarded by `guard`: the `Control` and `Raft` services if `control` runs
+/// here, and the `Database` and `Replication` services if `data` does. A node without the control role answers control calls with [`NoControl`], which names
 /// the control node at `control_address`.
 fn serve(
     listener: Listener,
     address: SocketAddr,
-    control: Option<ControlService>,
+    control: Option<(ControlService, RaftService)>,
     data: Option<&DataNode>,
     control_address: SocketAddr,
     guard: Guard,
@@ -1032,6 +1036,7 @@ fn serve(
         let _stop = stopped.await;
     };
     let no_control = control.is_none();
+    let (control, raft) = control.unzip();
     // The trace layer is outermost, so its span covers the boundary's checks and audit lines.
     let router = Server::builder()
         .layer(
@@ -1041,6 +1046,7 @@ fn serve(
                 .into_inner(),
         )
         .add_optional_service(control.map(control_server))
+        .add_optional_service(raft.map(raft_server))
         .add_optional_service(
             no_control.then(|| control_server(NoControl::new(control_address.to_string()))),
         )

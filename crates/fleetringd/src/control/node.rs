@@ -18,7 +18,8 @@ use std::time::Duration;
 
 use fleetring_control::fork::ForkLimits;
 use fleetring_control::{
-    Action, Command, ControlConfig, DEFAULT_TOMBSTONE_WINDOW, Millis, Outcome, Rejection, State,
+    Action, Command, ControlConfig, DEFAULT_TOMBSTONE_WINDOW, Millis, Outcome, Rejection, Software,
+    State,
 };
 use openraft::errors::{LinearizableReadError, RaftError};
 use openraft::raft::ReadPolicy;
@@ -29,14 +30,17 @@ use tokio::task::JoinHandle;
 
 use crate::clock::Clock;
 use crate::control::format1::{LogError, LogIndex};
-use crate::control::raft::codec::{SNAPSHOT_CHUNK_BYTES, VoteWire};
-use crate::control::raft::gate::GroupGate;
+use crate::control::raft::codec::{ProbeReply, SNAPSHOT_CHUNK_BYTES, VoteWire};
+use crate::control::raft::group::{GroupGate, GroupSoftware, Report};
 use crate::control::raft::log_storage::{RaftLog, SharedStore};
-use crate::control::raft::network::NoPeers;
+use crate::control::raft::network::{ControlNetwork, ProbeError, SNAPSHOT_CHUNK_TIMEOUT};
 use crate::control::raft::proposer::{ControlRaft, Mail, Proposer, ProposerSettings, Readiness};
 use crate::control::raft::runtime::with_generator;
+use crate::control::raft::service::RaftService;
 use crate::control::raft::state_machine::{ControlStateMachine, Published};
-use crate::control::raft::{ControlPeer, Membership, RaftId, RaftIdError, RaftSeed, check_raft_id};
+use crate::control::raft::{
+    ControlPeer, ControlTypes, Membership, RaftId, RaftIdError, RaftSeed, check_raft_id, raft_id,
+};
 use crate::control::store::ControlStore;
 use crate::environment::Network;
 use crate::observe::{ControlMetrics, RaftSample};
@@ -107,6 +111,7 @@ pub struct ControlOptions {
     log_keep: u64,
     snapshots_retained: NonZeroUsize,
     fork_limits: Option<ForkLimits>,
+    software: Option<Software>,
 }
 
 impl ControlOptions {
@@ -128,6 +133,7 @@ impl ControlOptions {
             log_keep: DEFAULT_LOG_KEEP,
             snapshots_retained: DEFAULT_SNAPSHOTS_RETAINED,
             fork_limits: None,
+            software: None,
         }
     }
 
@@ -204,6 +210,15 @@ impl ControlOptions {
         self
     }
 
+    /// Reports `software` to the control group's other members, and checks the group gate's
+    /// first uses against it for this node, instead of this build's own: for tests and
+    /// simulations of a group whose members run different releases.
+    #[must_use]
+    pub fn with_software(mut self, software: Software) -> Self {
+        self.software = Some(software);
+        self
+    }
+
     /// Returns the configuration a new log starts with. An existing log keeps its own.
     #[must_use]
     pub const fn config(&self) -> ControlConfig {
@@ -235,6 +250,7 @@ impl ControlOptions {
             max_in_snapshot_log_to_keep: self.log_keep,
             purge_batch_size: PURGE_BATCH.min(self.snapshot_every.get()),
             snapshot_max_chunk_size: u64::try_from(SNAPSHOT_CHUNK_BYTES).unwrap_or(u64::MAX),
+            install_snapshot_timeout: millis(SNAPSHOT_CHUNK_TIMEOUT),
             ..openraft::Config::default()
         }
         .validate()
@@ -403,6 +419,89 @@ impl ControlGroup {
     }
 }
 
+/// A voter or learner of the control group, as this node knows it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroupMember {
+    /// The member's node ID and address.
+    pub peer: ControlPeer,
+    /// Whether it votes, rather than learns.
+    pub voter: bool,
+    /// Whether it leads the control group, as this node knows.
+    pub leader: bool,
+    /// On the leader, the last log index the member is known to hold; 0 elsewhere.
+    pub matched_index: u64,
+    /// The software this node last heard the member report; its own for itself.
+    pub software: Option<Software>,
+}
+
+/// The error returned when the control group's membership can't be changed.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum GroupError {
+    /// This node isn't the control group's ready leader.
+    #[error("not the control leader")]
+    NotLeader {
+        /// The leader's address, if this node knows it.
+        leader: Option<String>,
+    },
+    /// The node to add was probed and refused (ADR-0040 point 4).
+    #[error("node '{node}' can't join the control group: {reason}")]
+    Probe {
+        /// The node.
+        node: String,
+        /// Why it was refused.
+        reason: String,
+    },
+    /// The change asks for something the group can't do.
+    #[error("{reason}")]
+    Invalid {
+        /// What is wrong with it.
+        reason: String,
+    },
+    /// A change of voters was interrupted between openraft's two steps, so the membership is
+    /// joint; another `set_voters` finishes it.
+    #[error("the control group's membership was left joint ({reason}); run set-voters again")]
+    Joint {
+        /// What interrupted it.
+        reason: String,
+    },
+    /// The node was added as a learner but hadn't caught up when the wait ended.
+    #[error("node '{node}' was added as a learner but hasn't caught up yet")]
+    CatchingUp {
+        /// The node.
+        node: String,
+    },
+    /// The membership change wasn't committed within the wait, so whether it takes effect is
+    /// unknown; the group's membership says.
+    #[error("the membership change wasn't committed in time; its outcome is unknown")]
+    NotCommitted,
+    /// openraft refused the change.
+    #[error("the control group refused the change: {reason}")]
+    Refused {
+        /// openraft's reason.
+        reason: String,
+    },
+    /// The control node has stopped.
+    #[error("the control node is not running")]
+    Stopped,
+}
+
+/// How long a probe of a node to add may take.
+const PROBE_LIMIT: Duration = Duration::from_secs(10);
+
+/// How many entries a new voter may lag the leader's log by when it is made a voter.
+const CAUGHT_UP_ENTRIES: u64 = 64;
+
+/// How many shortest election timeouts a proposal batch may wait for openraft's answer before the
+/// proposer refuses what queues behind it: long enough that a slow disk under load doesn't trip it,
+/// short enough that clients of a leader cut off from its quorum move on well within their
+/// deadlines.
+const STALL_ELECTIONS: u32 = 4;
+
+/// How long [`ControlHandle::add_node`] waits for a new learner to catch up, and a membership
+/// change waits to commit.
+const CATCH_UP_LIMIT: Duration = Duration::from_secs(60);
+
 /// A cheap, cloneable handle that submits commands to the control node and reads its state.
 #[derive(Clone)]
 pub struct ControlHandle {
@@ -415,6 +514,8 @@ pub struct ControlHandle {
     in_flight: Arc<AtomicUsize>,
     gate: GroupGate,
     own: ControlPeer,
+    /// The group's network, which probes a node before it is added; shared, since it is large.
+    network: Arc<ControlNetwork>,
     #[cfg(test)]
     faults: Arc<crate::control::raft::proposer::Faults>,
 }
@@ -525,9 +626,7 @@ impl ControlHandle {
                 })
             }
             Err(RaftError::APIError(LinearizableReadError::QuorumNotEnough(_))) => {
-                Err(SubmitError::CatchingUp {
-                    leader: Some(self.own.address.clone()),
-                })
+                Err(SubmitError::CatchingUp { leader: None })
             }
             Err(RaftError::Fatal(_)) => Err(SubmitError::Stopped),
         }
@@ -561,6 +660,336 @@ impl ControlHandle {
         }
     }
 
+    /// Returns every voter and learner, in Raft ID order, with the leader marked and what this
+    /// node knows of each.
+    #[must_use]
+    pub fn group_members(&self) -> Vec<GroupMember> {
+        let Some(raft) = &self.raft else {
+            return Vec::new();
+        };
+        let leader = self.leader();
+        let metrics = raft.metrics();
+        let metrics = metrics.borrow_watched();
+        let membership = metrics.membership_config.membership();
+        let voters: BTreeSet<RaftId> = membership.voter_ids().collect();
+        membership
+            .nodes()
+            .map(|(id, peer)| GroupMember {
+                peer: peer.clone(),
+                voter: voters.contains(id),
+                leader: leader
+                    .as_ref()
+                    .is_some_and(|leader| leader.node_id == peer.node_id),
+                matched_index: metrics
+                    .replication
+                    .as_ref()
+                    .and_then(|replication| replication.get(id))
+                    .and_then(|matched| matched.as_ref())
+                    .map_or(0, |log_id| log_id.index),
+                software: self.gate.group().last_heard(*id),
+            })
+            .collect()
+    }
+
+    /// Every voter's and learner's peer, as this node's membership names them; none on a node
+    /// that belongs to no group yet.
+    pub(crate) fn group_peers(&self) -> Vec<ControlPeer> {
+        let Some(raft) = &self.raft else {
+            return Vec::new();
+        };
+        let metrics = raft.metrics();
+        let metrics = metrics.borrow_watched();
+        metrics
+            .membership_config
+            .membership()
+            .nodes()
+            .map(|(_, peer)| peer.clone())
+            .collect()
+    }
+
+    /// The control group's Raft, unless the node stopped at an entry it can't decode.
+    pub(crate) fn raft_group(&self) -> Option<&ControlRaft> {
+        self.raft.as_ref()
+    }
+
+    /// Whether this node's store holds any Raft state: a vote, a log, a snapshot, or a
+    /// membership. A node that stopped at an entry it can't decode holds some.
+    pub(crate) fn has_raft_state(&self) -> bool {
+        let Some(raft) = &self.raft else {
+            return true;
+        };
+        let metrics = raft.metrics();
+        let metrics = metrics.borrow_watched();
+        metrics.vote.leader_id.term > 0
+            || metrics.last_log_index.is_some()
+            || metrics.snapshot.is_some()
+            || metrics
+                .membership_config
+                .membership()
+                .nodes()
+                .next()
+                .is_some()
+    }
+
+    /// Whether this node holds or has applied any log entry or snapshot, so that its state's
+    /// configuration is its store's genesis; a fresh joiner holds none, and takes the genesis of
+    /// the first snapshot it installs.
+    pub(crate) fn holds_log(&self) -> bool {
+        let Some(raft) = &self.raft else {
+            return true;
+        };
+        let metrics = raft.metrics();
+        let metrics = metrics.borrow_watched();
+        metrics.last_log_index.is_some()
+            || metrics.snapshot.is_some()
+            || metrics.last_applied.is_some()
+    }
+
+    /// The ready leader's Raft, or why this node can't change the group.
+    fn leading(&self) -> Result<&ControlRaft, GroupError> {
+        let Some(raft) = &self.raft else {
+            return Err(GroupError::Stopped);
+        };
+        match self.leadership() {
+            Readiness::Ready { .. } => Ok(raft),
+            Readiness::Follower { leader } => Err(GroupError::NotLeader {
+                leader: leader.map(|peer| peer.address),
+            }),
+            Readiness::CatchingUp { .. } => Err(GroupError::NotLeader {
+                leader: Some(self.own.address.clone()),
+            }),
+        }
+    }
+
+    /// Adds the node `node`, which serves at `address`, to the control group as a learner, and
+    /// waits for it to catch up with the leader's log.
+    ///
+    /// The node is probed first, and refused when its node ID isn't `node`, its store holds Raft
+    /// state, its release can't run beside a fleet member's or a group member's, it lacks a fleet
+    /// feature the fleet has enabled, its control state starts from another genesis
+    /// configuration than the group's, or it has no `Raft` service (ADR-0040 point 4).
+    ///
+    /// # Errors
+    ///
+    /// [`GroupError::NotLeader`] off the ready leader, [`GroupError::Probe`] when the probe
+    /// refuses the node, [`GroupError::Invalid`] for a node already a member or whose Raft ID
+    /// collides with a member's, [`GroupError::CatchingUp`] when the learner hasn't caught up
+    /// within a minute, and [`GroupError::Refused`] or [`GroupError::Stopped`] from openraft.
+    pub async fn add_node(&self, node: &str, address: &str) -> Result<(), GroupError> {
+        let raft = self.leading()?;
+        let peers = self.group_peers();
+        if peers.iter().any(|peer| peer.node_id == node) {
+            return Err(GroupError::Invalid {
+                reason: format!("node '{node}' is already a member of the control group"),
+            });
+        }
+        let id = check_raft_id(node, peers.iter().map(|peer| peer.node_id.as_str())).map_err(
+            |error| GroupError::Invalid {
+                reason: error.to_string(),
+            },
+        )?;
+        let refuse = |reason: String| GroupError::Probe {
+            node: node.to_owned(),
+            reason,
+        };
+        let state = self.state();
+        let reply = match self.network.probe(address, PROBE_LIMIT).await {
+            Ok(reply) => reply,
+            Err(ProbeError::NotControl) => {
+                return Err(refuse(format!(
+                    "node '{node}' doesn't run the control role; start it with `role = \"control\"` \
+                     or `\"both\"` and `[control] bootstrap = \"join\"`"
+                )));
+            }
+            Err(ProbeError::NoControlGroup) => {
+                let release = node
+                    .parse()
+                    .ok()
+                    .and_then(|id| state.member(&id).map(|member| member.running()))
+                    .map_or_else(
+                        || "a fleetring release".to_owned(),
+                        |software| format!("fleetring {}", software.release()),
+                    );
+                return Err(refuse(format!(
+                    "node '{node}' runs {release}, which has no control group"
+                )));
+            }
+            Err(ProbeError::Refused(why)) => {
+                return Err(refuse(format!(
+                    "it belongs to a control group this node isn't a member of ({why})"
+                )));
+            }
+            Err(error) => return Err(refuse(error.to_string())),
+        };
+        probe_verdict(node, &reply, &state, &self.gate).map_err(refuse)?;
+        let peer = ControlPeer::new(node, address);
+        // The gate counts the node from now on, before openraft's membership names it, so no first
+        // use slips in while it is being added.
+        self.gate.group().add_member(id, peer.clone());
+        let added = tokio::time::timeout(CATCH_UP_LIMIT, raft.add_learner(id, peer, true)).await;
+        match added {
+            Err(_elapsed) => Err(GroupError::CatchingUp {
+                node: node.to_owned(),
+            }),
+            Ok(Ok(_)) => {
+                tracing::info!(
+                    node,
+                    address,
+                    "a node was added to the control group as a learner"
+                );
+                Ok(())
+            }
+            Ok(Err(error)) => Err(group_error(error)),
+        }
+    }
+
+    /// Makes `voters` the control group's voters, each of them a member already; a voter left
+    /// out stays a learner. The count must be odd, and each new voter must hold the leader's log
+    /// to within a few entries and have reported its software this term.
+    ///
+    /// # Errors
+    ///
+    /// [`GroupError::NotLeader`] off the ready leader, [`GroupError::Invalid`] for an even
+    /// count, a node that isn't a member, or a new voter behind or unheard, and
+    /// [`GroupError::Refused`] or [`GroupError::Stopped`] from openraft.
+    /// [`GroupError::NotCommitted`] if the change isn't committed within a minute, and
+    /// [`GroupError::Joint`] instead of either when the membership was left joint.
+    pub async fn set_voters(&self, voters: &[&str]) -> Result<(), GroupError> {
+        let raft = self.leading()?;
+        let peers = self.group_peers();
+        let mut ids = BTreeSet::new();
+        for voter in voters {
+            if !peers.iter().any(|peer| peer.node_id == *voter) {
+                return Err(GroupError::Invalid {
+                    reason: format!(
+                        "node '{voter}' isn't a member of the control group; add it first"
+                    ),
+                });
+            }
+            ids.insert(raft_id(voter));
+        }
+        if ids.len() % 2 == 0 {
+            return Err(GroupError::Invalid {
+                reason: format!(
+                    "a control group needs an odd number of voters, not {}",
+                    ids.len()
+                ),
+            });
+        }
+        self.check_new_voters(raft, voters)?;
+        let changed = tokio::time::timeout(CATCH_UP_LIMIT, raft.change_membership(ids, true)).await;
+        let failed = match changed {
+            Ok(Ok(_)) => None,
+            Ok(Err(error)) => Some(group_error(error)),
+            Err(_elapsed) => Some(GroupError::NotCommitted),
+        };
+        if let Some(error) = failed {
+            // A change interrupted between openraft's two steps leaves the group joint, which
+            // needs both configurations' quorums until another change finishes it.
+            return Err(if self.is_joint() {
+                GroupError::Joint {
+                    reason: error.to_string(),
+                }
+            } else {
+                error
+            });
+        }
+        tracing::info!(?voters, "the control group's voters changed");
+        Ok(())
+    }
+
+    /// Refuses a new voter that hasn't caught up with the leader's log, or whose software this
+    /// leader hasn't heard this term: either could leave the new configuration without a quorum.
+    fn check_new_voters(&self, raft: &ControlRaft, voters: &[&str]) -> Result<(), GroupError> {
+        let current: BTreeSet<String> = self
+            .group()
+            .voters()
+            .iter()
+            .map(|peer| peer.node_id.clone())
+            .collect();
+        let reports = self.gate.group().reports();
+        let metrics = raft.metrics();
+        let metrics = metrics.borrow_watched();
+        let last = metrics.last_log_index.unwrap_or_default();
+        for voter in voters.iter().filter(|voter| !current.contains(**voter)) {
+            let matched = metrics
+                .replication
+                .as_ref()
+                .and_then(|replication| replication.get(&raft_id(voter)))
+                .and_then(|matched| matched.as_ref())
+                .map_or(0, |log_id| log_id.index);
+            if last.saturating_sub(matched) > CAUGHT_UP_ENTRIES {
+                return Err(GroupError::Invalid {
+                    reason: format!(
+                        "node '{voter}' holds the log through {matched}, and the leader's reaches \
+                         {last}; wait for it to catch up"
+                    ),
+                });
+            }
+            let known = reports
+                .iter()
+                .any(|(id, report)| id.as_str() == *voter && matches!(report, Report::Known(_)));
+            if !known {
+                return Err(GroupError::Invalid {
+                    reason: format!(
+                        "control node '{voter}' hasn't reported its software yet; wait for it to \
+                         answer the leader"
+                    ),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether the control group's membership is joint: a change of voters openraft began and
+    /// hasn't finished, which needs both configurations' quorums meanwhile.
+    #[must_use]
+    pub fn is_joint(&self) -> bool {
+        let Some(raft) = &self.raft else {
+            return false;
+        };
+        let metrics = raft.metrics();
+        let metrics = metrics.borrow_watched();
+        metrics
+            .membership_config
+            .membership()
+            .get_joint_config()
+            .len()
+            > 1
+    }
+
+    /// Removes the learner `node` from the control group.
+    ///
+    /// # Errors
+    ///
+    /// [`GroupError::NotLeader`] off the ready leader, [`GroupError::Invalid`] for a node that
+    /// isn't a member or still votes, and [`GroupError::Refused`] or [`GroupError::Stopped`]
+    /// from openraft. [`GroupError::NotCommitted`] if the change isn't committed within a
+    /// minute.
+    pub async fn remove_node(&self, node: &str) -> Result<(), GroupError> {
+        let raft = self.leading()?;
+        let group = self.group();
+        if group.voters().iter().any(|peer| peer.node_id == node) {
+            return Err(GroupError::Invalid {
+                reason: format!(
+                    "node '{node}' is a voter; take it out of the voters with set-voters first"
+                ),
+            });
+        }
+        if !group.learners().iter().any(|peer| peer.node_id == node) {
+            return Err(GroupError::Invalid {
+                reason: format!("node '{node}' isn't a member of the control group"),
+            });
+        }
+        let removal = openraft::ChangeMembers::RemoveNodes(BTreeSet::from([raft_id(node)]));
+        match tokio::time::timeout(CATCH_UP_LIMIT, raft.change_membership(removal, false)).await {
+            Err(_elapsed) => return Err(GroupError::NotCommitted),
+            Ok(changed) => changed.map_err(group_error)?,
+        };
+        tracing::info!(node, "a node was removed from the control group");
+        Ok(())
+    }
+
     /// Returns the leader this node knows of, if any: itself or another member.
     #[must_use]
     pub fn leader(&self) -> Option<ControlPeer> {
@@ -579,7 +1008,7 @@ impl ControlHandle {
     /// Returns the group gate this node's proposals pass (ADR-0040 point 4).
     #[must_use]
     pub fn gate(&self) -> GroupGate {
-        self.gate
+        self.gate.clone()
     }
 
     /// Why the control log stopped applying, if it met an entry this build can't decode
@@ -630,6 +1059,115 @@ impl ControlHandle {
     }
 }
 
+/// Why the probed node `node` may not join the group whose leader's state is `state` and whose
+/// gate is `gate`, or nothing if it may (ADR-0040 point 4).
+fn probe_verdict(
+    node: &str,
+    reply: &ProbeReply,
+    state: &State,
+    gate: &GroupGate,
+) -> Result<(), String> {
+    if reply.node_id != node {
+        return Err(format!(
+            "the node at that address is '{}', not '{node}'",
+            reply.node_id
+        ));
+    }
+    if reply.has_raft_state {
+        return Err(
+            "its store already holds Raft state, as a node started with `[control] bootstrap = \
+             \"new\"` does; start it on an empty data directory with `bootstrap = \"join\"`"
+                .to_owned(),
+        );
+    }
+    let release = reply.software.release();
+    // Members that report no software, which no supported release sends, aren't counted.
+    for member in state.members() {
+        let Some(theirs) = member.software() else {
+            continue;
+        };
+        if !release.runs_beside(theirs.release()) {
+            return Err(format!(
+                "its release {release} can't run beside member '{}' on {}",
+                member.id(),
+                theirs.release()
+            ));
+        }
+    }
+    for (id, theirs) in gate.group().releases() {
+        let Some(theirs) = theirs else {
+            return Err(format!(
+                "control node '{id}' hasn't reported its software yet, so the release window \
+                 can't be checked"
+            ));
+        };
+        if !release.runs_beside(&theirs) {
+            return Err(format!(
+                "its release {release} can't run beside control node '{id}' on {theirs}"
+            ));
+        }
+    }
+    if let Some(feature) = state
+        .features()
+        .find(|feature| !reply.software.supports(*feature))
+    {
+        return Err(format!(
+            "it lacks fleet feature '{}', which the fleet has enabled",
+            feature.as_str()
+        ));
+    }
+    let ours = state.config();
+    let Some(theirs) = reply.genesis else {
+        return Err("it doesn't say which configuration its control state starts from".to_owned());
+    };
+    let settings = [
+        (
+            "lease_duration_ms",
+            theirs.lease_duration(),
+            ours.lease_duration(),
+        ),
+        (
+            "failover_margin_ms",
+            theirs.failover_margin(),
+            ours.failover_margin(),
+        ),
+        (
+            "heartbeat_timeout_ms",
+            theirs.heartbeat_timeout(),
+            ours.heartbeat_timeout(),
+        ),
+    ];
+    if let Some((name, theirs, ours)) = settings.iter().find(|(_, theirs, ours)| theirs != ours) {
+        return Err(format!(
+            "its [control] {name} is {} where the control group's is {}; a joiner replays the \
+             log from that configuration, so set it equally on every control node",
+            theirs.get(),
+            ours.get()
+        ));
+    }
+    if theirs != *ours {
+        return Err("its control state starts from another configuration than the group's".into());
+    }
+    Ok(())
+}
+
+/// The group error for openraft's refusal of a membership change.
+fn group_error(
+    error: RaftError<ControlTypes, openraft::errors::ClientWriteError<ControlTypes>>,
+) -> GroupError {
+    match error {
+        RaftError::APIError(openraft::errors::ClientWriteError::ForwardToLeader(forward)) => {
+            GroupError::NotLeader {
+                leader: forward.leader_node.map(|peer| peer.address),
+            }
+        }
+        RaftError::APIError(other) => GroupError::Refused {
+            reason: other.to_string(),
+        },
+        RaftError::Fatal(_) => GroupError::Stopped,
+    }
+}
+
 /// A running control node: its control group, its proposer, and a handle to both.
 #[derive(Debug)]
 pub struct ControlNode {
@@ -640,6 +1178,8 @@ pub struct ControlNode {
     tasks: Vec<JoinHandle<()>>,
     /// Tells the proposer to stop even while it waits for a batch to be answered.
     stopping: watch::Sender<bool>,
+    /// What the `Raft` service stamps its replies with.
+    clock: Arc<dyn Clock>,
 }
 
 /// What a control node found when it opened its log.
@@ -703,7 +1243,7 @@ impl ControlNode {
         let opening = Opening {
             path: path.into(),
             options,
-            clock: Box::new(clock),
+            clock: Arc::new(clock),
             own,
             own_raft,
             network,
@@ -722,6 +1262,16 @@ impl ControlNode {
     #[must_use]
     pub fn recovered(&self) -> RecoverySummary {
         self.recovered
+    }
+
+    /// Returns the control node's `Raft` service, which carries its group's messages from the
+    /// other members (ADR-0040).
+    pub(crate) fn raft_service(&self) -> RaftService {
+        RaftService::new(
+            self.handle.clone(),
+            self.handle.gate.group().clone(),
+            Arc::clone(&self.clock),
+        )
     }
 
     /// How many appends the node's log storage made, each one transaction with one sync.
@@ -755,7 +1305,7 @@ impl ControlNode {
 struct Opening {
     path: PathBuf,
     options: ControlOptions,
-    clock: Box<dyn Clock>,
+    clock: Arc<dyn Clock>,
     own: ControlPeer,
     own_raft: RaftId,
     network: Network,
@@ -787,6 +1337,22 @@ impl Opening {
                 "the control log keeps the timings it was created with",
             );
         }
+        let own_node: fleetring::NodeId = own
+            .node_id
+            .parse()
+            .map_err(|error| OpenError::Raft(Box::new(error)))?;
+        let group = GroupSoftware::new(
+            own_node.clone(),
+            options
+                .software
+                .clone()
+                .unwrap_or_else(crate::software::running),
+            options.election_timeout,
+            opened.genesis().failover_margin(),
+            metrics.clone(),
+        );
+        let gate = GroupGate::new(group.clone());
+        let control_network = ControlNetwork::new(network, group, Arc::clone(&clock));
         let store: SharedStore = Arc::new(Mutex::new(opened));
         let found = {
             let store = Arc::clone(&store);
@@ -823,8 +1389,9 @@ impl Opening {
                     readiness,
                     raft: None,
                     in_flight: Arc::new(AtomicUsize::new(0)),
-                    gate: GroupGate::new(),
+                    gate,
                     own,
+                    network: Arc::new(control_network),
                     #[cfg(test)]
                     faults: Arc::default(),
                 },
@@ -832,12 +1399,13 @@ impl Opening {
                 log,
                 tasks: Vec::new(),
                 stopping: watch::channel(false).0,
+                clock,
             });
         }
         let raft = ControlRaft::new(
             own_raft,
             Arc::new(raft_config),
-            NoPeers::new(network),
+            control_network.clone(),
             log.clone(),
             machine,
         )
@@ -877,15 +1445,14 @@ impl Opening {
         let (stopping, stopping_receiver) = watch::channel(false);
         let running = Proposer::spawn(
             raft.clone(),
-            clock,
+            Box::new(Arc::clone(&clock)),
             ProposerSettings {
-                own: own
-                    .node_id
-                    .parse()
-                    .map_err(|error| OpenError::Raft(Box::new(error)))?,
+                gate: gate.clone(),
+                own: own_node,
                 peer: own.clone(),
                 tombstone_window: options.tombstone_window,
                 fork_limits: options.fork_limits,
+                stall_after: options.election_timeout.saturating_mul(STALL_ELECTIONS),
             },
             published.applied.clone(),
             metrics.clone(),
@@ -929,8 +1496,9 @@ impl Opening {
                 readiness: running.readiness,
                 raft: Some(raft),
                 in_flight: running.in_flight,
-                gate: GroupGate::new(),
+                gate,
                 own,
+                network: Arc::new(control_network),
                 #[cfg(test)]
                 faults: running.faults,
             },
@@ -938,6 +1506,7 @@ impl Opening {
             log,
             tasks: vec![running.task, watcher],
             stopping,
+            clock,
         })
     }
 }

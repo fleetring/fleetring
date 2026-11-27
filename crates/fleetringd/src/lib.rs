@@ -124,6 +124,8 @@ const _: () = {
     assert_debug_send_sync::<control::Committed>();
     assert_debug_send_sync::<control::ControlClient>();
     assert_debug_send_sync::<control::ControlGroup>();
+    assert_debug_send_sync::<control::GroupError>();
+    assert_debug_send_sync::<control::GroupMember>();
     assert_debug_send_sync::<control::ControlHandle>();
     assert_debug_send_sync::<control::ControlNode>();
     assert_debug_send_sync::<control::ControlOptions>();
@@ -136,6 +138,7 @@ const _: () = {
     assert_debug_send_sync::<control::raft::ControlRuntime>();
     assert_debug_send_sync::<control::raft::ControlTypes>();
     assert_debug_send_sync::<control::raft::GroupGate>();
+    assert_debug_send_sync::<control::raft::GroupSoftware>();
     assert_debug_send_sync::<control::raft::LeaderRef>();
     assert_debug_send_sync::<control::raft::ParseRaftIdError>();
     assert_debug_send_sync::<control::raft::RaftIdError>();

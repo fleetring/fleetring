@@ -50,8 +50,8 @@ pub use fork::SeedProgress;
 pub(crate) use format1::file_format;
 pub use format1::{LogError, LogIndex, Recovered};
 pub use node::{
-    Bootstrap, Committed, ControlGroup, ControlHandle, ControlNode, ControlOptions, OpenError,
-    RecoverySummary, StorageIo, SubmitError,
+    Bootstrap, Committed, ControlGroup, ControlHandle, ControlNode, ControlOptions, GroupError,
+    GroupMember, OpenError, RecoverySummary, StorageIo, SubmitError,
 };
 pub use raft::Readiness;
 pub use service::{
