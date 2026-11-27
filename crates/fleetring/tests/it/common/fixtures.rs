@@ -322,6 +322,8 @@ mod tests {
     }
 
     proptest! {
+        #![proptest_config(crate::common::seed::fixed_seed(Config::default()))]
+
         #[test]
         fn generated_memberships_follow_the_topology_rules(nodes in memberships()) {
             prop_assert!((1..=MAX_NODES).contains(&nodes.len()), "{} nodes", nodes.len());

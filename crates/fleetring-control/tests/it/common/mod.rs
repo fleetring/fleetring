@@ -12,6 +12,7 @@ use proptest::prelude::*;
 
 pub(crate) mod delegation;
 pub(crate) mod fork;
+pub(crate) mod seed;
 
 /// Node IDs the generator draws from.
 pub(crate) const NODES: [&str; 5] = ["n0", "n1", "n2", "n3", "n4"];

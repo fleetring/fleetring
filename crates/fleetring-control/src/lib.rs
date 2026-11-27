@@ -142,6 +142,8 @@ pub mod matcher;
 mod member;
 mod metadata;
 pub mod mutation;
+#[cfg(test)]
+mod proptest_seed;
 mod revocation;
 pub mod scope;
 mod software;

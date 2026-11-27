@@ -114,6 +114,8 @@ mod tests {
     }
 
     proptest! {
+        #![proptest_config(crate::proptest_seed::fixed_seed(ProptestConfig::default()))]
+
         #[test]
         fn selection_is_preference_prefix(
             fixture in testing::fixtures(), key_hash in any::<u64>(), mask in any::<u32>(),

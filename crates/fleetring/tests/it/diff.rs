@@ -665,6 +665,8 @@ fn joining_node() -> impl Strategy<Value = Node> {
 }
 
 proptest! {
+    #![proptest_config(crate::common::seed::fixed_seed(ProptestConfig::default()))]
+
     #[test]
     fn adding_a_node_copies_only_to_it_and_removing_it_mirrors_that(
         nodes in fixtures::memberships_up_to(16),

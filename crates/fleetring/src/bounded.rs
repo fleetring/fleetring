@@ -748,6 +748,8 @@ mod tests {
     }
 
     proptest! {
+        #![proptest_config(crate::proptest_seed::fixed_seed(ProptestConfig::default()))]
+
         #[test]
         fn capacity_is_the_exact_ceiling(
             total in 0..1u128 << 60,

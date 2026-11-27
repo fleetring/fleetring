@@ -224,6 +224,8 @@ fn the_fixture_ring_keeps_its_fingerprint() {
 }
 
 proptest! {
+    #![proptest_config(crate::common::seed::fixed_seed(ProptestConfig::default()))]
+
     #[test]
     fn a_ring_rebuilt_from_its_spec_writes_the_same_spec(spec in any_spec()) {
         let ring = Ring::from_spec(&spec, Xxh3).expect("a ring's own spec is valid");
@@ -415,6 +417,8 @@ fn an_invalid_ring_is_rejected_with_the_build_error_as_its_source() -> TestResul
 }
 
 proptest! {
+    #![proptest_config(crate::common::seed::fixed_seed(ProptestConfig::default()))]
+
     #[test]
     fn fingerprints_print_16_lowercase_hex_digits_and_parse_back(value in any::<u64>()) {
         let fingerprint = Fingerprint::new(value);
@@ -484,6 +488,8 @@ mod hashers {
     use super::*;
 
     proptest! {
+        #![proptest_config(crate::common::seed::fixed_seed(ProptestConfig::default()))]
+
         #[test]
         fn the_fingerprint_covers_a_same_named_hasher_that_moves_a_probe(
             nodes in fixtures::memberships_up_to(12),
