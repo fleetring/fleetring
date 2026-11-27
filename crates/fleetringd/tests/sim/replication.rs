@@ -102,10 +102,23 @@ fn writes_through_faults(seed: u64) -> Result<Report, Box<dyn Error>> {
     fleet.run_for(Duration::from_millis(500))?;
 
     // Without either follower there is no write quorum: writes fail rather than being
-    // acknowledged.
+    // acknowledged. A write fails once the acknowledgement timeout passes, so the quorum stays
+    // lost until one has: a follower back sooner could still acknowledge every write that waits.
     fleet.partition(&primary, first)?;
     fleet.crash(second)?;
+    let lost_at = fleet.elapsed();
     fleet.run_for(Duration::from_secs(2))?;
+    fleet.run_until(
+        settings().ack_timeout * 2,
+        "a write refused without a write quorum",
+        |fleet| {
+            fleet.history().records().iter().any(|record| {
+                matches!(record.operation(), Operation::Write { .. })
+                    && record.invoked_at() >= lost_at
+                    && !matches!(record.outcome(), Outcome::Acknowledged(_))
+            })
+        },
+    )?;
     fleet.check_history()?;
     fleet.repair(&primary, first)?;
     fleet.restart(second)?;
