@@ -384,7 +384,7 @@ impl Daemon {
             role = ?config.role,
             listen = %server.address,
             advertise = %advertised(&config, server.address),
-            control = ?config.control.address,
+            control = ?config.control.control_addresses(),
             heartbeat_interval_ms = config.membership.heartbeat_interval_ms.get(),
             data_dir = %data_dir.path().display(),
             tls = !network.security().is_plaintext(),
@@ -769,7 +769,23 @@ async fn bind_admin(
 /// The address this node reaches the control plane at: `[control] address`, or else its own
 /// listener, which the control role shares.
 fn control_address(config: &Config, bound: SocketAddr) -> SocketAddr {
-    config.control.address.unwrap_or_else(|| reachable(bound))
+    config
+        .control
+        .control_addresses()
+        .first()
+        .copied()
+        .unwrap_or_else(|| reachable(bound))
+}
+
+/// Every address this node may reach the control plane at, in order: `[control] addresses`, or
+/// `address`, or else its own listener, which the control role shares (ADR-0040 point 12).
+fn control_addresses(config: &Config, bound: SocketAddr) -> Vec<String> {
+    let configured = config.control.control_addresses();
+    if configured.is_empty() {
+        vec![reachable(bound).to_string()]
+    } else {
+        configured.iter().map(ToString::to_string).collect()
+    }
 }
 
 /// The data role's address for peers: `[node] advertise`, or else the address it serves on.
@@ -793,7 +809,7 @@ fn start_data(
     let engine = SqliteEngine::new(config.engine.page_size)?;
     let archive_engine: Arc<dyn DatabaseEngine> = Arc::new(engine.clone());
     let network = environment.network();
-    let control = network.control_client(control_address(config, bound).to_string());
+    let control = network.control_client_at(control_addresses(config, bound));
     let member = config
         .node
         .to_member()

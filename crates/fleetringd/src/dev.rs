@@ -163,6 +163,9 @@ pub(crate) fn validate(config: &Config) -> Result<(), ConfigError> {
     if let Some(control) = config.control.address {
         loopback("control.address", control)?;
     }
+    for control in &config.control.addresses {
+        loopback("control.addresses", *control)?;
+    }
     if config.admin.enabled == AdminListener::Enabled {
         loopback("admin.listen", config.admin.listen)?;
     }
@@ -2048,6 +2051,26 @@ mod tests {
         assert!(reason.contains("starts its own group"), "{reason}");
         let new = generated().replace("[control]\n", "[control]\nbootstrap = \"new\"\n");
         assert!(Config::from_toml(&new).is_ok(), "{new}");
+    }
+
+    /// Every control address a dev node names must be loopback, `addresses` as well as `address`
+    /// (ADR-0040 point 9).
+    #[test]
+    fn dev_mode_refuses_non_loopback_control_addresses() {
+        let text = generated().replace(
+            "[control]\n",
+            "[control]\naddresses = [\"127.0.0.1:7400\", \"10.0.0.2:7400\"]\n",
+        );
+        let error = Config::from_toml(&text).expect_err("a remote address");
+        let ConfigError::Invalid { field, .. } = &error else {
+            panic!("{error}");
+        };
+        assert_eq!(*field, "control.addresses");
+        let local = generated().replace(
+            "[control]\n",
+            "[control]\naddresses = [\"127.0.0.1:7400\"]\n",
+        );
+        assert!(Config::from_toml(&local).is_ok(), "{local}");
     }
 
     #[test]

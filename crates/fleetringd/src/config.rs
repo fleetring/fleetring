@@ -990,7 +990,9 @@ impl Default for ReplicationConfig {
 ///
 /// ```toml
 /// [control]
-/// address = "10.0.0.1:7400"   # required on a data-only node
+/// address = "10.0.0.1:7400"   # required on a data-only node, or `addresses`
+/// # addresses = ["10.0.0.1:7400", "10.0.0.2:7400", "10.0.0.3:7400"]  # the control group's
+/// #                           # members, in place of `address`, tried in order
 /// lease_duration_ms = 10000
 /// lease_renewal_ms = 2000     # how often a primary renews each lease; a fifth of the lease
 ///                             # duration if unset
@@ -1028,8 +1030,13 @@ impl Default for ReplicationConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ControlSettings {
-    /// The control node's address. Required unless this node runs the control role itself.
+    /// The control node's address. Required unless this node runs the control role itself, or
+    /// `addresses` is set.
     pub address: Option<SocketAddr>,
+    /// The control group's addresses, in place of `address`: a data node or a client tries them
+    /// in order, and learns the group's members from join and heartbeat replies (ADR-0040 point
+    /// 12).
+    pub addresses: Vec<SocketAddr>,
     /// How long a lease lasts after it is granted or renewed, in milliseconds.
     pub lease_duration_ms: NonZeroU64,
     /// How often a primary renews each lease it holds, in milliseconds. Unset, it is a fifth of
@@ -1068,6 +1075,16 @@ pub struct ControlSettings {
 }
 
 impl ControlSettings {
+    /// Returns the control plane's addresses as configured: `addresses`, or `address` alone, or
+    /// none.
+    #[must_use]
+    pub fn control_addresses(&self) -> Vec<SocketAddr> {
+        match self.address {
+            Some(address) if self.addresses.is_empty() => vec![address],
+            _ => self.addresses.clone(),
+        }
+    }
+
     /// Returns the timing rules for a new control state.
     #[must_use]
     pub fn control_config(&self) -> ControlConfig {
@@ -1138,6 +1155,7 @@ impl Default for ControlSettings {
         let nonzero = |millis: Millis| NonZeroU64::new(millis.get()).unwrap_or(NonZeroU64::MIN);
         Self {
             address: None,
+            addresses: Vec::new(),
             lease_duration_ms: nonzero(config.lease_duration()),
             lease_renewal_ms: None,
             failover_margin_ms: config.failover_margin().get(),
@@ -1218,13 +1236,18 @@ pub enum ConfigError {
 
 impl Config {
     /// The address a client on this machine dials to reach the control plane: `control.address`,
-    /// or `listen` if this node runs the control role. `None` if neither applies, or if `listen`
-    /// names port 0, which only the running daemon can resolve.
+    /// or the first of `control.addresses`, or `listen` if this node runs the control role. `None`
+    /// if neither applies, or if `listen` names port 0, which only the running daemon can resolve.
     #[must_use]
     pub fn control_target(&self) -> Option<SocketAddr> {
-        self.control.address.or_else(|| {
-            (self.role.runs_control() && self.listen.port() != 0).then(|| reachable(self.listen))
-        })
+        self.control
+            .control_addresses()
+            .first()
+            .copied()
+            .or_else(|| {
+                (self.role.runs_control() && self.listen.port() != 0)
+                    .then(|| reachable(self.listen))
+            })
     }
 
     /// The delegation issuer pair this node loads (ADR-0047, points 1.3 and 1.7):
@@ -1293,10 +1316,17 @@ impl Config {
     /// may supply one; see [`Daemon::start_with`](crate::Daemon::start_with).
     pub fn validate(&self) -> Result<(), ConfigError> {
         dev::validate(self)?;
-        if self.role == NodeRole::Data && self.control.address.is_none() {
+        if self.control.address.is_some() && !self.control.addresses.is_empty() {
+            return Err(ConfigError::Invalid {
+                field: "control.addresses",
+                reason: "set `address` or `addresses`, not both".to_owned(),
+            });
+        }
+        if self.role == NodeRole::Data && self.control.control_addresses().is_empty() {
             return Err(ConfigError::Missing {
                 field: "control.address",
-                reason: "a data-only node must know the control node's address",
+                reason: "a data-only node must know the control node's address, or the control \
+                         group's `addresses`",
             });
         }
         self.validate_issuer()?;
@@ -1496,6 +1526,55 @@ mod tests {
         assert_eq!(control.longest_election_timeout_ms(), 2_000);
         let join = with("\n[control]\nbootstrap = \"join\"\n").expect("join");
         assert_eq!(join.control.bootstrap, Bootstrap::Join);
+    }
+
+    /// A node names the control plane by `address` or by `addresses`, never both; a data-only
+    /// node needs one of them, and the first address is the one a client on the machine dials.
+    #[test]
+    fn control_addresses_are_one_list_or_one_address() {
+        let data = "role = \"data\"\n";
+        let both = format!(
+            "{data}{MINIMAL}\n[control]\naddress = \"10.0.0.1:7400\"\naddresses = [\"10.0.0.2:7400\"]\n"
+        );
+        let refused = Config::from_toml(&both).expect_err("both");
+        assert!(
+            matches!(
+                refused,
+                ConfigError::Invalid {
+                    field: "control.addresses",
+                    ..
+                }
+            ),
+            "{refused}"
+        );
+        let neither = Config::from_toml(&format!("{data}{MINIMAL}")).expect_err("neither");
+        assert!(
+            matches!(
+                neither,
+                ConfigError::Missing {
+                    field: "control.address",
+                    ..
+                }
+            ),
+            "{neither}"
+        );
+        let list = Config::from_toml(&format!(
+            "{data}{MINIMAL}\n[control]\naddresses = [\"10.0.0.2:7400\", \"10.0.0.3:7400\"]\n"
+        ))
+        .expect("a list");
+        assert_eq!(list.control.control_addresses().len(), 2);
+        assert_eq!(
+            list.control_target(),
+            Some("10.0.0.2:7400".parse().expect("an address"))
+        );
+        let one = Config::from_toml(&format!(
+            "{data}{MINIMAL}\n[control]\naddress = \"10.0.0.1:7400\"\n"
+        ))
+        .expect("one");
+        assert_eq!(
+            one.control.control_addresses(),
+            ["10.0.0.1:7400".parse().expect("an address")]
+        );
     }
 
     #[test]

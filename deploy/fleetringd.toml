@@ -64,8 +64,11 @@ id = "node-1"
 # advertise = "192.0.2.10:7400"
 
 # [control]
-# The control node's address. Required when `role = "data"`.
+# The control node's address. Required when `role = "data"`, unless `addresses` is set.
 # address = "192.0.2.1:7400"
+# A control group's members, in place of `address`: a data node tries them in order, and learns
+# the group from its join and heartbeat replies (ADR-0040). Set one of the two, not both.
+# addresses = ["192.0.2.1:7400", "192.0.2.2:7400", "192.0.2.3:7400"]
 
 # [replication]
 # The replication factor and durability a database gets when `db create` names none (ADR-0023,

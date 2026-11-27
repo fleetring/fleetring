@@ -36,7 +36,10 @@ fn the_example_router_config_is_valid() -> Result<(), Box<dyn Error>> {
         config.serves_tls(),
         "off loopback, the example serves HTTPS"
     );
-    assert_eq!(config.control.address.to_string(), "10.0.0.1:7400");
+    assert_eq!(
+        config.control.addresses(),
+        ["10.0.0.1:7400".parse::<std::net::SocketAddr>()?]
+    );
     let defaults = fleetringd::router::RouterConfig::from_toml(
         "listen = \"127.0.0.1:8080\"\n[control]\naddress = \"10.0.0.1:7400\"\n",
     )?;

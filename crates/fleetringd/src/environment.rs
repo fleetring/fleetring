@@ -221,6 +221,17 @@ impl Network {
         ControlClient::with_connector(address, move |address| network.channel(address))
             .with_credentials(credentials)
     }
+
+    /// A control client that tries `addresses` in order, learns the control group's members
+    /// from join and heartbeat replies, and dials every one over this network (ADR-0040 point
+    /// 12).
+    #[must_use]
+    pub fn control_client_at(&self, addresses: Vec<String>) -> ControlClient {
+        let network = self.clone();
+        let credentials = self.credentials.clone();
+        ControlClient::with_connector_at(addresses, move |address| network.channel(address))
+            .with_credentials(credentials)
+    }
 }
 
 impl Default for Network {

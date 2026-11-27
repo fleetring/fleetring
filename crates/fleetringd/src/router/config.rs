@@ -22,7 +22,7 @@ use crate::config::{ConfigError, LogConfig, Plaintext, TlsConfig};
 /// key = "/etc/fleetring/tls/client.router.key"
 ///
 /// [control]
-/// address = "10.0.0.1:7400"
+/// address = "10.0.0.1:7400"   # or addresses = ["10.0.0.1:7400", "10.0.0.2:7400", ...]
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -102,13 +102,29 @@ impl HttpConfig {
     }
 }
 
-/// The `[control]` table: the control node the router asks where databases live.
+/// The `[control]` table: the control plane the router asks where databases live, by one
+/// address or by the control group's addresses (ADR-0040 point 12), never both.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 #[non_exhaustive]
 pub struct RouterControl {
     /// The control node's address; the router follows leader redirects from there.
-    pub address: SocketAddr,
+    #[serde(default)]
+    pub address: Option<SocketAddr>,
+    /// The control group's addresses, in place of `address`, tried in order.
+    #[serde(default)]
+    pub addresses: Vec<SocketAddr>,
+}
+
+impl RouterControl {
+    /// Returns the configured addresses: `addresses`, or `address` alone.
+    #[must_use]
+    pub fn addresses(&self) -> Vec<SocketAddr> {
+        match self.address {
+            Some(address) if self.addresses.is_empty() => vec![address],
+            _ => self.addresses.clone(),
+        }
+    }
 }
 
 /// How long a database's primary is cached when nothing names a new one: 60 seconds.
@@ -281,6 +297,19 @@ impl RouterConfig {
     /// if `http.advertise_url` isn't an absolute `http` or `https` URL without a query; or if
     /// `routing.host_suffix` isn't a DNS name.
     pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.control.address.is_some() && !self.control.addresses.is_empty() {
+            return Err(ConfigError::Invalid {
+                field: "control.addresses",
+                reason: "set `address` or `addresses`, not both".to_owned(),
+            });
+        }
+        if self.control.addresses().is_empty() {
+            return Err(ConfigError::Missing {
+                field: "control.address",
+                reason: "the router must know the control node's address, or the control group's \
+                         `addresses`",
+            });
+        }
         if self.http.cert.is_some() != self.http.key.is_some() {
             return Err(ConfigError::Invalid {
                 field: "http.cert",
@@ -359,6 +388,24 @@ mod tests {
 
     fn with(listen: &str, more: &str) -> Result<RouterConfig, ConfigError> {
         RouterConfig::from_toml(&format!("listen = \"{listen}\"\n{more}\n{BASE}"))
+    }
+
+    /// The router names the control plane by `address` or by `addresses`, never both, and needs
+    /// one of them.
+    #[test]
+    fn the_control_plane_is_one_address_or_one_list() {
+        let parse = |control: &str| {
+            RouterConfig::from_toml(&format!(
+                "listen = \"127.0.0.1:8080\"\n[control]\n{control}"
+            ))
+        };
+        let both = parse("address = \"127.0.0.1:7400\"\naddresses = [\"127.0.0.1:7401\"]\n")
+            .expect_err("both");
+        assert!(both.to_string().contains("control.addresses"), "{both}");
+        let neither = parse("").expect_err("neither");
+        assert!(neither.to_string().contains("control.address"), "{neither}");
+        let list = parse("addresses = [\"127.0.0.1:7400\", \"127.0.0.1:7401\"]\n").expect("a list");
+        assert_eq!(list.control.addresses().len(), 2);
     }
 
     #[test]

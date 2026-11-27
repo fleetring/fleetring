@@ -55,7 +55,10 @@ key = "/etc/fleetring/tls/client.router.key"
 
 [control]
 # The control node the router asks where each database's primary is, with the caller's token. It
-# follows leader redirects from there.
+# follows leader redirects from there. With a control group of three or five, list every member
+# instead, as `addresses = ["10.0.0.1:7400", "10.0.0.2:7400", "10.0.0.3:7400"]`: the router tries
+# them in order, moving on from one that is down, and follows leader redirects (ADR-0040). Set
+# one of `address` and `addresses`, not both.
 address = "10.0.0.1:7400"
 
 [routing]
