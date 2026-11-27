@@ -16,8 +16,8 @@ use fleetring_control::{
 use proptest::prelude::*;
 
 use crate::common::fork::{
-    SOURCE, complete, create_at, fork_of, fork_request, heartbeat_of, identity, limits, op,
-    principal, replica, report_copy_lost, report_reset, report_staged, with_incarnation,
+    SOURCE, complete, create_at, fork_of, fork_request, fork_state, heartbeat_of, identity, limits,
+    op, principal, replica, report_copy_lost, report_reset, report_staged, with_incarnation,
     with_intent,
 };
 use crate::common::{at, config, create, current_software, db, factor, id};
@@ -743,19 +743,32 @@ fn check_invariants(
             database.incarnation()
         );
     }
-    // (f) An operation ID names one fork, and a terminal outcome never changes.
+    // (f) An operation ID names one fork, and a terminal outcome never changes, for as long as
+    // the ID is known. A record past its retention is unknown even before a `Tick` prunes it, so
+    // a request with its ID starts a new operation whose record replaces it (ADR-0046, point
+    // 5.3): only a record still live when the command applies must keep its fork.
     for (operation, record) in after.fork_operations() {
         let fork = (record.target().to_string(), record.target_incarnation());
         let first = seen
             .operations
             .entry(*operation)
             .or_insert_with(|| fork.clone());
-        if before
-            .fork_operations()
-            .any(|(known, _)| known == operation)
-        {
+        if before.fork_operation(operation, command.at).is_some() {
             assert_eq!(*first, fork, "operation {operation} changed forks");
         } else {
+            // Only a new fork replaces a record past its retention.
+            let replaced = before
+                .fork_operations()
+                .any(|(known, old)| known == operation && old != record);
+            if replaced {
+                assert!(
+                    matches!(
+                        outcome,
+                        Ok(Applied::ForkCreated { operation: created, .. }) if created == operation
+                    ),
+                    "{command:?} replaced the record of {operation}: {outcome:?}"
+                );
+            }
             *first = fork;
             seen.terminal.remove(operation);
         }
@@ -783,6 +796,77 @@ proptest! {
         });
         check_replay_from_scratch(&log.commands, &log.outcomes, &log.state);
     }
+}
+
+/// An operation ID past its retention is unknown before a `Tick` prunes its record, so a request
+/// with it starts a new fork whose record replaces the old one (ADR-0046, point 5.3). The fork
+/// the old record named, still present, can't touch the new record: its commands are refused,
+/// and dropping it leaves the new operation pending. The generated logs found the replacement.
+#[test]
+fn an_operation_id_reused_before_a_tick_names_only_the_new_fork() {
+    let mut log = Log::new();
+    let mut seen = Seen::default();
+    let mut step = |log: &mut Log, millis: u64, action: Action| {
+        let before = log.state.clone();
+        let command = Command::new(at(millis), action.clone());
+        let outcome = log.run(millis, action);
+        check_invariants(&mut seen, &before, &command, &outcome, &log.state);
+        outcome
+    };
+    for node in FORK_NODES {
+        let member = Member::new(id(node)).with_software(current_software());
+        step(&mut log, 0, Action::Join { member }).expect("join");
+    }
+    step(&mut log, 0, create(SOURCE, 3)).expect("source");
+    step(&mut log, 10, fork_of(1, "t", SOURCE, 3)).expect("fork");
+    let old = identity(&log.state, "t");
+    let fail = Action::FailFork {
+        fork: old.clone(),
+        attempt: 1,
+        reason: ForkFailure::SourceTooLarge,
+    };
+    step(&mut log, 20, fail.clone()).expect("fail");
+    let forgotten = 20 + limits().operation_retention.get();
+
+    // Within the retention the ID is known: another name conflicts.
+    let again = with_incarnation(fork_of(1, "u", SOURCE, 3), 0x0B);
+    assert!(matches!(
+        step(&mut log, forgotten - 1, again.clone()),
+        Err(Rejection::OperationConflict { .. })
+    ));
+    // At the boundary, with no `Tick` in between, it starts a new fork.
+    for node in FORK_NODES {
+        step(&mut log, forgotten, heartbeat_of(node, Vec::new(), None)).expect("hb");
+    }
+    let created = step(&mut log, forgotten, again).expect("a new fork");
+    assert!(
+        matches!(&created, Applied::ForkCreated { database, .. } if *database == db("u")),
+        "{created:?}"
+    );
+    let new = identity(&log.state, "u");
+    assert_eq!(new.operation, old.operation);
+    let named = |state: &State| {
+        state
+            .fork_operation(&old.operation, at(forgotten))
+            .map(|record| (record.target().clone(), record.target_incarnation()))
+    };
+    assert_eq!(named(&log.state), Some((db("u"), new.incarnation)));
+    assert!(matches!(
+        fork_state(&log.state, "t"),
+        ForkState::Failed { .. }
+    ));
+
+    // The old fork's identity changes nothing, and dropping it doesn't cancel the new operation.
+    step(&mut log, forgotten, fail).expect_err("failed already");
+    step(&mut log, forgotten, Action::DropDatabase { name: db("t") }).expect("drop");
+    assert_eq!(named(&log.state), Some((db("u"), new.incarnation)));
+    assert_eq!(
+        log.state
+            .fork_operation(&old.operation, at(forgotten))
+            .map(|record| record.outcome().clone()),
+        Some(OperationOutcome::Pending { attempt: 1 })
+    );
+    log.check();
 }
 
 /// Two long fixed fork logs replay identically from snapshots and through serialization, and
