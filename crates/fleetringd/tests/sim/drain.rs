@@ -228,9 +228,10 @@ const ACK_TIMEOUT: Duration = Duration::from_secs(12);
 /// drain fails at once, rather than holding the client until the acknowledgement timeout.
 ///
 /// The busiest node is cut off from both followers while the writer keeps writing, so writes to
-/// its databases commit there and wait for acknowledgements that can't come. An operator drains
-/// the node. Its databases move on; every write that was waiting must end soon after, as `ABORTED`
-/// ("may or may not have taken effect"), with the history checks holding throughout.
+/// its databases commit there and wait for acknowledgements that can't come. Once one is waiting,
+/// an operator drains the node. Its databases move on; every write that was waiting must end soon
+/// after, as `ABORTED` ("may or may not have taken effect"), with the history checks holding
+/// throughout.
 fn drain_releases_writes_waiting_for_acknowledgements(seed: u64) -> TestResult {
     let mut fleet = Fleet::builder(seed)
         .control(CONTROL)
@@ -250,10 +251,23 @@ fn drain_releases_writes_waiting_for_acknowledgements(seed: u64) -> TestResult {
 
     let (drained, held) = busiest(&fleet).ok_or("no primaries")?;
     let held_names: Vec<DatabaseName> = held.iter().map(|(name, _)| name.clone()).collect();
+    let is_held_write = |operation: &Operation| matches!(operation, Operation::Write { database, .. } if held_names.contains(database));
     for other in DATA.into_iter().filter(|node| *node != drained) {
         fleet.partition(&drained, other)?;
     }
+    let cut_at = fleet.elapsed();
     fleet.run_for(Duration::from_millis(300))?;
+    // The writer picks each write's database at random, so it may not have written to one of the
+    // drained node's databases yet: hold the drain until a write to one is waiting.
+    fleet.run_until(
+        Duration::from_secs(10),
+        "a write waiting for acknowledgements",
+        |fleet| {
+            fleet.history().pending().any(|(_, pending)| {
+                is_held_write(pending.operation()) && pending.invoked_at() >= cut_at
+            })
+        },
+    )?;
     let drain_requested = fleet.elapsed();
     operator.push(Operation::Drain {
         node: drained.parse()?,
@@ -268,7 +282,6 @@ fn drain_releases_writes_waiting_for_acknowledgements(seed: u64) -> TestResult {
 
     // The writes that were waiting have ended, and not by timing out: none is still pending, and
     // each that ended did so within a moment of the move.
-    let is_held_write = |operation: &Operation| matches!(operation, Operation::Write { database, .. } if held_names.contains(database));
     let history = fleet.history();
     let still_pending: Vec<String> = history
         .pending()
@@ -318,9 +331,11 @@ fn drain_releases_writes_waiting_for_acknowledgements(seed: u64) -> TestResult {
 
 #[test]
 fn a_drain_releases_writes_waiting_for_acknowledgements() {
+    // 779389119744756260: the writer had written to none of the drained node's databases 300 ms
+    // into the cut (FR-132).
     seeds::run(
         BINARY,
-        &seeds::FIXED_HEAVY,
+        &[1, 2_026, 779_389_119_744_756_260],
         drain_releases_writes_waiting_for_acknowledgements,
     );
 }
