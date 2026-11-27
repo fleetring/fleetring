@@ -1012,7 +1012,7 @@ mod tests {
     }
 
     proptest! {
-        #![proptest_config(ProptestConfig::with_cases(128))]
+        #![proptest_config(crate::proptest_seed::fixed_seed(ProptestConfig::with_cases(128)))]
 
         #[test]
         fn internals_do_not_depend_on_insertion_order(

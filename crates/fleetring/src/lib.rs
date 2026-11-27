@@ -323,6 +323,8 @@ mod label;
 mod lookup;
 mod math;
 mod node;
+#[cfg(test)]
+mod proptest_seed;
 mod rendezvous;
 mod replica;
 mod ring;

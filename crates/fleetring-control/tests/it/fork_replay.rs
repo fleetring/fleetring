@@ -783,7 +783,7 @@ fn check_invariants(
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(48))]
+    #![proptest_config(crate::common::seed::fixed_seed(ProptestConfig::with_cases(48)))]
 
     /// Generated fork logs keep the invariants after every command, and replay identically.
     #[test]

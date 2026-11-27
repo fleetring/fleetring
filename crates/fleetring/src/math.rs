@@ -264,6 +264,8 @@ mod tests {
     }
 
     proptest! {
+        #![proptest_config(crate::proptest_seed::fixed_seed(ProptestConfig::default()))]
+
         #[test]
         fn neg_log2_is_monotone(a in any::<u64>(), b in any::<u64>()) {
             let (low, high) = if a <= b { (a, b) } else { (b, a) };

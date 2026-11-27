@@ -334,7 +334,7 @@ fn body(pattern: &str) -> (&str, bool) {
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(512))]
+    #![proptest_config(crate::common::seed::fixed_seed(ProptestConfig::with_cases(512)))]
 
     /// ADR-0047, point 3.5 and 3.6, as the plan pins them: the tier accepts a scope exactly when
     /// the lattice's own `covers` puts it under `agent-<root>-` or `agent-<root>.` (and a grant
@@ -425,7 +425,7 @@ fn arb_agent() -> impl Strategy<Value = AgentName> {
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(256))]
+    #![proptest_config(crate::common::seed::fixed_seed(ProptestConfig::with_cases(256)))]
 
     /// `root`, `parent`, `child`, and `depth` walk one lineage, and at-or-below is that lineage.
     #[test]
@@ -546,7 +546,7 @@ fn arb_link() -> impl Strategy<Value = ChainLink> {
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(256))]
+    #![proptest_config(crate::common::seed::fixed_seed(ProptestConfig::with_cases(256)))]
 
     /// Adding entries never un-refuses a token, and the verdict is exactly whether the list
     /// shares an entry with the token's own ID and key and its chain's.

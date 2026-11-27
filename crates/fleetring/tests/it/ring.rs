@@ -156,6 +156,8 @@ fn expected_error(nodes: &[Node]) -> Option<BuildRingError> {
 }
 
 proptest! {
+    #![proptest_config(crate::common::seed::fixed_seed(ProptestConfig::default()))]
+
     #[test]
     fn permutations_of_the_same_nodes_build_identical_rings(
         (nodes, shuffled) in with_shuffle(valid_nodes()),

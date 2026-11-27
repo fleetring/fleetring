@@ -773,7 +773,9 @@ mod tests {
     }
 
     proptest::proptest! {
-        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(512))]
+        #![proptest_config(crate::proptest_seed::fixed_seed(
+            proptest::prelude::ProptestConfig::with_cases(512),
+        ))]
 
         /// ADR-0047 §6.5 refuses scope text that isn't the canonical form of what it parses to,
         /// by comparing the text with what it parses to, printed. That is sound only if every

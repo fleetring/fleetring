@@ -11,4 +11,5 @@
 pub(crate) mod corpus;
 pub(crate) mod fixtures;
 pub(crate) mod prng;
+pub(crate) mod seed;
 pub(crate) mod stats;

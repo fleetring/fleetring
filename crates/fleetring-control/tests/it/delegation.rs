@@ -363,7 +363,7 @@ fn apply_refuses_another_owner_or_a_later_exp_than_the_parent_record() {
 // ---- I3 ----
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(24))]
+    #![proptest_config(crate::common::seed::fixed_seed(ProptestConfig::with_cases(24)))]
 
     /// Whatever the caller, a recorded child's chain is the caller's chain followed by the
     /// caller's own ID and the key of the copy it presented, its parent is the caller, and its
@@ -867,7 +867,7 @@ fn caller_revoked_first_is_refused() {
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(32))]
+    #![proptest_config(crate::common::seed::fixed_seed(ProptestConfig::with_cases(32)))]
 
     /// However delegations and revocations, by token or principal, with `fleet` or under the
     /// ancestor rule, interleave, at equal or increasing stamps, no live delegation is left that

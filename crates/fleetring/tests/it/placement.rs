@@ -135,6 +135,8 @@ fn strategies() -> impl proptest::strategy::Strategy<Value = fleetring::Strategy
 }
 
 proptest! {
+    #![proptest_config(crate::common::seed::fixed_seed(ProptestConfig::default()))]
+
     #[test]
     fn filtering_nodes_equals_removing_them(
         nodes in fixtures::memberships_up_to(16),

@@ -403,7 +403,7 @@ fn build_tree(tree: &[(u32, Vec<Leaf>)], top_vnodes: bool) -> Result<Cells<Cells
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(64))]
+    #![proptest_config(crate::common::seed::fixed_seed(ProptestConfig::with_cases(64)))]
 
     /// ADR-0012, point 3: cell weights are explicit, so no change inside a cell moves a key to
     /// another cell, at any depth.

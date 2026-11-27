@@ -720,7 +720,7 @@ fn two_layers() -> impl proptest::strategy::Strategy<Value = Cells<Cells>> {
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(32))]
+    #![proptest_config(crate::common::seed::fixed_seed(ProptestConfig::with_cases(32)))]
 
     #[test]
     fn two_layers_round_trip_through_their_specs(fleet in two_layers()) {

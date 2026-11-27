@@ -493,6 +493,8 @@ fn one_at_a_time_placement_keeps_every_node_within_its_capacity() -> TestResult 
 }
 
 proptest! {
+    #![proptest_config(crate::common::seed::fixed_seed(ProptestConfig::default()))]
+
     #[test]
     fn placements_match_the_adr_definition(scenario in scenarios()) {
         let ring = scenario.ring();

@@ -5,6 +5,8 @@ use proptest::prelude::*;
 const INVALID: &[char] = &['A', 'Z', ' ', '/', '@', '\n', '\0', 'é', '名', '\u{7f}'];
 
 proptest! {
+    #![proptest_config(crate::common::seed::fixed_seed(ProptestConfig::default()))]
+
     #[test]
     fn grammar_strings_parse_and_round_trip(label in "[a-z0-9._:-]{1,64}") {
         let id: NodeId = label.parse().expect("label matches the grammar");

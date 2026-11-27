@@ -38,7 +38,7 @@ fn leased_set(state: &State, database: &DatabaseName) -> Option<BTreeSet<fleetri
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(64))]
+    #![proptest_config(crate::common::seed::fixed_seed(ProptestConfig::with_cases(64)))]
 
     /// FR-102: once every member supports the hand-over, a join or a leave never changes the
     /// replica set a leased database's promotions fence; only a release does (ADR-0031,
