@@ -131,5 +131,11 @@ fn opened_in(history: &fleetringd::sim::History) -> BTreeMap<DatabaseName, Strin
 
 #[test]
 fn databases_are_created_and_written_through_the_data_plane_under_faults() {
-    seeds::run(BINARY, &[33, 1, 24, 2_026], writes_under_faults);
+    // 1435108083953097795: a renewal sent just before the cut from control stalled its
+    // connection, and db-3's lease expired behind it (FR-132).
+    seeds::run(
+        BINARY,
+        &[33, 1, 24, 2_026, 1_435_108_083_953_097_795],
+        writes_under_faults,
+    );
 }

@@ -5,7 +5,9 @@
 //!   A refusal that names a newer epoch or another holder means the lease is gone: the node stops
 //!   serving the database and closes it, so that its copy can follow the new primary. A control
 //!   plane that can't be reached changes nothing: the primary keeps serving, because no other
-//!   node can be granted a newer epoch meanwhile (point 6). Safety never depends on this timer:
+//!   node can be granted a newer epoch meanwhile (point 6). A renewal that times out has the next
+//!   round dial the control plane again, since a stalled connection would hold up every renewal
+//!   until the lease expired. Safety never depends on this timer:
 //!   followers fenced at a newer epoch refuse the old primary's batches, so it can't acknowledge
 //!   a write however long it takes to notice.
 //! - **Dropped databases.** A node deletes a copy only on a **tombstone** in control state that
@@ -341,7 +343,13 @@ async fn recover(node: &DataNode, restarting: &mut JoinSet<()>) -> bool {
 /// Renews every lease the node holds, each within `limit`, and stops serving each one the control
 /// plane says is gone. One the control plane doesn't know goes to `dropped`, to be flushed, and
 /// then kept as an orphan unless a drop notice arrives (ADR-0042).
+///
+/// A renewal that times out drops the control client's connections, so the next round dials
+/// again: a connection can stall without failing, as behind a partition, and every renewal on it
+/// would time out too until the lease expired, however briefly the control plane was out of
+/// reach.
 async fn renew_all(node: &DataNode, limit: Duration, dropped: &mpsc::UnboundedSender<Dropped>) {
+    let mut timed_out = false;
     let mut renewals = JoinSet::new();
     for (database, lease) in node.held_leases() {
         let control = node.inner.control.clone();
@@ -389,8 +397,12 @@ async fn renew_all(node: &DataNode, limit: Duration, dropped: &mpsc::UnboundedSe
             }
             Err(_) => {
                 tracing::debug!(database = %database, "renewing the lease timed out; still serving");
+                timed_out = true;
             }
         }
+    }
+    if timed_out {
+        node.inner.control.reconnect();
     }
 }
 
