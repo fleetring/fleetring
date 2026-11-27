@@ -177,7 +177,14 @@ impl Router {
             address: config.listen,
             source,
         })?;
-        let control = network.control_client(config.control.address.to_string());
+        let control = network.control_client_at(
+            config
+                .control
+                .addresses()
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
+        );
         let context = Arc::new(Context {
             placement: PlacementCache::new(
                 config.routing.placement_ttl(),

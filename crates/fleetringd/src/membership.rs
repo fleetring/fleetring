@@ -775,6 +775,7 @@ impl Heartbeats {
             for database in unknown.difference(&self.unknown) {
                 tracing::warn!(node = %id, database, "the control plane doesn't know this database; its reports are ignored");
             }
+            self.client.learn(&response.control_nodes);
             self.unknown = unknown;
             self.denylist
                 .receive(revocations_from_proto(response.revocations.clone()));
@@ -823,6 +824,7 @@ async fn heartbeat_loop(
             match timeout(heartbeats.limit, heartbeats.client.join(join.clone())).await {
                 Ok(Ok(response)) => {
                     tracing::info!(node = %id, epoch = response.membership_epoch, "joined the fleet");
+                    heartbeats.client.learn(&response.control_nodes);
                     heartbeats
                         .denylist
                         .receive(revocations_from_proto(response.revocations));
@@ -836,10 +838,12 @@ async fn heartbeat_loop(
                     continue;
                 }
                 Err(_) => {
+                    // The next try goes to the next control address, on a new connection: this
+                    // one may hang, or stall without failing.
+                    heartbeats.client.reconnect();
                     timeouts += 1;
                     if timeouts >= STALLED_HEARTBEATS {
-                        tracing::warn!(node = %id, "joining the fleet keeps timing out; will retry on a new connection");
-                        heartbeats.client.reconnect();
+                        tracing::warn!(node = %id, "joining the fleet keeps timing out; each try goes to the next control address");
                         timeouts = 0;
                     } else {
                         tracing::debug!(node = %id, "joining the fleet timed out; the next heartbeat shows whether it landed");
@@ -887,10 +891,12 @@ async fn heartbeat_loop(
                 failing = true;
             }
             Err(_) => {
+                // The next heartbeat goes to the next control address, on a new connection: this
+                // one may hang, or stall without failing.
+                heartbeats.client.reconnect();
                 timeouts += 1;
                 if timeouts >= STALLED_HEARTBEATS {
-                    tracing::warn!(node = %id, "heartbeats keep timing out; will retry on a new connection");
-                    heartbeats.client.reconnect();
+                    tracing::warn!(node = %id, "heartbeats keep timing out; each goes to the next control address");
                     timeouts = 0;
                 } else {
                     tracing::debug!(node = %id, "heartbeat timed out; will retry");

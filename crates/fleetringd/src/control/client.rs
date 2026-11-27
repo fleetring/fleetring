@@ -9,7 +9,7 @@ use fleetring_client::redirect::leader_hint;
 use fleetring_proto::v1::control_client::ControlClient as GrpcControlClient;
 use fleetring_proto::v1::{
     AcquireLeaseRequest, ChangeDurabilityRequest, ChangeDurabilityResponse,
-    CompletePromotionRequest, CompletePromotionResponse, CreateDatabaseRequest,
+    CompletePromotionRequest, CompletePromotionResponse, ControlNode, CreateDatabaseRequest,
     CreateDatabaseResponse, CreateDatabaseWithMetadataRequest, DelegateTokenRequest,
     DelegateTokenResponse, DrainRequest, DrainResponse, DropDatabaseRequest, DropDatabaseResponse,
     ForkDatabaseRequest, ForkOperationStatus, GetForkOperationRequest, HeartbeatRequest,
@@ -57,8 +57,62 @@ pub struct ControlClient {
 struct Shared {
     connect: Box<Connect>,
     credentials: Credentials,
-    leader: Mutex<String>,
+    addresses: Mutex<Addresses>,
     channels: Mutex<BTreeMap<String, Channel>>,
+}
+
+/// Where the client sends calls: the addresses it was configured with, those the control group's
+/// replies named, and the one it uses now.
+#[derive(Debug, Clone, Default)]
+struct Addresses {
+    configured: Vec<String>,
+    learned: Vec<String>,
+    current: String,
+}
+
+impl Addresses {
+    fn new(configured: Vec<String>) -> Self {
+        Self {
+            current: configured.first().cloned().unwrap_or_default(),
+            configured,
+            learned: Vec::new(),
+        }
+    }
+
+    /// Every address to try, the configured ones first, then the learned ones, without repeats.
+    fn candidates(&self) -> Vec<String> {
+        let mut candidates: Vec<String> = Vec::new();
+        for address in self.configured.iter().chain(&self.learned) {
+            if !candidates.contains(address) {
+                candidates.push(address.clone());
+            }
+        }
+        candidates
+    }
+
+    /// Moves on from `failed` to the next candidate, if it is still the current address.
+    fn advance(&mut self, failed: &str) {
+        if self.current != failed {
+            return;
+        }
+        let candidates = self.candidates();
+        let next = match candidates.iter().position(|address| address == failed) {
+            Some(at) => candidates.get((at + 1) % candidates.len()),
+            None => candidates.first(),
+        };
+        if let Some(next) = next {
+            self.current.clone_from(next);
+        }
+    }
+}
+
+/// What a call does when an address answers `UNAVAILABLE` without naming a leader.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Unavailable {
+    /// Try the next address, until every one has been tried: for calls a resend can't harm.
+    NextAddress,
+    /// Return the status; the next call starts at the next address.
+    Return,
 }
 
 impl fmt::Debug for ControlClient {
@@ -74,7 +128,13 @@ impl ControlClient {
     /// A client that reaches the control node at `address` (`host:port`) over TCP.
     #[must_use]
     pub fn new(address: impl Into<String>, transport: TransportConfig) -> Self {
-        Self::with_connector(address, move |address| {
+        Self::with_addresses(vec![address.into()], transport)
+    }
+
+    /// A client that tries the control group's `addresses` (`host:port`) in order over TCP.
+    #[must_use]
+    pub fn with_addresses(addresses: Vec<String>, transport: TransportConfig) -> Self {
+        Self::with_connector_at(addresses, move |address| {
             Ok(Endpoint::from_shared(format!("http://{address}"))?
                 .connect_timeout(transport.connect_timeout)
                 .timeout(transport.request_timeout)
@@ -91,11 +151,23 @@ impl ControlClient {
         address: impl Into<String>,
         connect: impl Fn(&str) -> Result<Channel, tonic::transport::Error> + Send + Sync + 'static,
     ) -> Self {
+        Self::with_connector_at(vec![address.into()], connect)
+    }
+
+    /// A client that opens channels with `connect`, trying `addresses` in order (ADR-0040 point
+    /// 12): an address that answers `UNAVAILABLE` without naming a leader moves the client to the
+    /// next, and the control group's members, learned from join and heartbeat replies, join the
+    /// list.
+    #[must_use]
+    pub fn with_connector_at(
+        addresses: Vec<String>,
+        connect: impl Fn(&str) -> Result<Channel, tonic::transport::Error> + Send + Sync + 'static,
+    ) -> Self {
         Self {
             shared: Arc::new(Shared {
                 connect: Box::new(connect),
                 credentials: Credentials::none(),
-                leader: Mutex::new(address.into()),
+                addresses: Mutex::new(Addresses::new(addresses)),
                 channels: Mutex::new(BTreeMap::new()),
             }),
             backoff: Backoff::default(),
@@ -129,18 +201,71 @@ impl ControlClient {
     /// If the client's lock was poisoned by a panic in another thread.
     #[must_use]
     pub fn leader(&self) -> String {
-        self.shared
-            .leader
-            .lock()
-            .expect("control client lock poisoned")
-            .clone()
+        self.addresses().current.clone()
     }
 
-    /// Drops every connection the client holds, so the next call dials again.
+    fn addresses(&self) -> std::sync::MutexGuard<'_, Addresses> {
+        self.shared
+            .addresses
+            .lock()
+            .expect("control client lock poisoned")
+    }
+
+    /// Returns every address the client may try, in order: the configured ones, then those it
+    /// learned.
+    ///
+    /// # Panics
+    ///
+    /// If the client's lock was poisoned by a panic in another thread.
+    #[must_use]
+    pub fn addresses_to_try(&self) -> Vec<String> {
+        self.addresses().candidates()
+    }
+
+    /// Learns the control group's members from a join or heartbeat reply (ADR-0040 point 12):
+    /// their addresses join the ones the client tries once an address fails, the leader's first.
+    /// The client keeps calling the address that answers: a member's advertised address may not
+    /// be one this node reaches it at, behind a proxy or after it moved, and a redirect already
+    /// finds the leader. An empty list, from a control node that predates the field, changes
+    /// nothing.
+    ///
+    /// # Panics
+    ///
+    /// If the client's lock was poisoned by a panic in another thread.
+    pub fn learn(&self, nodes: &[ControlNode]) {
+        let leaders = nodes.iter().filter(|node| node.leader);
+        let others = nodes.iter().filter(|node| !node.leader);
+        let learned: Vec<String> = leaders
+            .chain(others)
+            .map(|node| node.address.clone())
+            .filter(|address| !address.is_empty())
+            .collect();
+        if learned.is_empty() {
+            return;
+        }
+        self.addresses().learned = learned;
+    }
+
+    /// Moves the client on from the address it calls now to the next one it may try: for a caller
+    /// whose own deadline ended a call before the address answered, as a hung control node, or one
+    /// behind a partition that drops packets, makes it do. A redirect brings the client back if
+    /// that address still leads.
+    ///
+    /// # Panics
+    ///
+    /// If the client's lock was poisoned by a panic in another thread.
+    pub fn advance(&self) {
+        let mut addresses = self.addresses();
+        let current = addresses.current.clone();
+        addresses.advance(&current);
+    }
+
+    /// Drops every connection the client holds, so the next call dials again, and moves on to
+    /// the next address, as [`ControlClient::advance`] does.
     ///
     /// Use it when calls time out without failing: a connection can stay open while nothing
-    /// crosses it, for example after a network partition or a machine's sleep. Streams already
-    /// open keep their connection.
+    /// crosses it, for example after a network partition or a machine's sleep, and the control
+    /// node behind it may hang. Streams already open keep their connection.
     ///
     /// # Panics
     ///
@@ -151,6 +276,7 @@ impl ControlClient {
             .lock()
             .expect("control client lock poisoned")
             .clear();
+        self.advance();
     }
 
     /// Joins the fleet. Retried.
@@ -582,7 +708,10 @@ impl ControlClient {
             let request = request.clone();
             async move { client.locate(request).await }
         };
-        retry(self.backoff, || self.following_as(credentials, &call)).await
+        retry(self.backoff, || {
+            self.following_as(credentials, &call, Unavailable::NextAddress)
+        })
+        .await
     }
 
     async fn retrying<T, F, Fut>(&self, call: F) -> Result<T, Status>
@@ -590,40 +719,78 @@ impl ControlClient {
         F: Fn(GrpcControlClient<CredentialedChannel>) -> Fut,
         Fut: Future<Output = Result<Response<T>, Status>>,
     {
-        retry(self.backoff, || self.following(&call)).await
+        retry(self.backoff, || {
+            self.following_as(&self.shared.credentials, &call, Unavailable::NextAddress)
+        })
+        .await
     }
 
-    /// Calls the current leader, and follows up to [`MAX_REDIRECTS`] redirects.
+    /// Calls the current leader once, and follows up to [`MAX_REDIRECTS`] redirects; an address
+    /// that answers `UNAVAILABLE` without naming a leader moves the next call to the next
+    /// address.
     async fn following<T, F, Fut>(&self, call: &F) -> Result<T, Status>
     where
         F: Fn(GrpcControlClient<CredentialedChannel>) -> Fut,
         Fut: Future<Output = Result<Response<T>, Status>>,
     {
-        self.following_as(&self.shared.credentials, call).await
+        self.following_as(&self.shared.credentials, call, Unavailable::Return)
+            .await
     }
 
-    /// As [`following`](Self::following), with `credentials` on each call.
+    /// Calls the current address with `credentials`, follows up to [`MAX_REDIRECTS`] redirects,
+    /// and on `UNAVAILABLE` without a leader to name, moves to the next address, trying each
+    /// once if `unavailable` says to.
     async fn following_as<T, F, Fut>(
         &self,
         credentials: &Credentials,
         call: &F,
+        unavailable: Unavailable,
     ) -> Result<T, Status>
     where
         F: Fn(GrpcControlClient<CredentialedChannel>) -> Fut,
         Fut: Future<Output = Result<Response<T>, Status>>,
     {
         let mut redirects = 0;
+        let mut moved = 0;
         loop {
-            match call(self.current(credentials)?).await {
-                Ok(response) => return Ok(response.into_inner()),
-                Err(status) => match leader_hint(&status) {
-                    Some(leader) if redirects < MAX_REDIRECTS => {
-                        tracing::debug!(%leader, "following a control leader redirect");
-                        self.set_leader(leader);
-                        redirects += 1;
+            let address = self.leader();
+            let answer = match self.current(credentials) {
+                Ok(client) => call(client).await.map(Response::into_inner),
+                Err(status) => Err(status),
+            };
+            let status = match answer {
+                Ok(response) => return Ok(response),
+                Err(status) => status,
+            };
+            match leader_hint(&status) {
+                Some(leader) if redirects < MAX_REDIRECTS => {
+                    tracing::debug!(%leader, "following a control leader redirect");
+                    self.set_leader(leader);
+                    redirects += 1;
+                }
+                // `CANCELLED` and `DEADLINE_EXCEEDED` are what a call to an address that hangs ends
+                // with, once the channel's request timeout passes.
+                None if matches!(
+                    status.code(),
+                    Code::Unavailable | Code::Cancelled | Code::DeadlineExceeded
+                ) =>
+                {
+                    let candidates = {
+                        let mut addresses = self.addresses();
+                        addresses.advance(&address);
+                        addresses.candidates().len()
+                    };
+                    moved += 1;
+                    // A call that never reached a server can go to the next address whatever it
+                    // is: a resend can't repeat it.
+                    let resend =
+                        unavailable == Unavailable::NextAddress || never_delivered(&status);
+                    if !resend || moved >= candidates {
+                        return Err(status);
                     }
-                    _ => return Err(status),
-                },
+                    tracing::debug!(%address, next = %self.leader(), "a control address is unavailable; trying the next");
+                }
+                _ => return Err(status),
             }
         }
     }
@@ -649,10 +816,22 @@ impl ControlClient {
     }
 
     fn set_leader(&self, leader: String) {
-        *self
-            .shared
-            .leader
-            .lock()
-            .expect("control client lock poisoned") = leader;
+        self.addresses().current = leader;
     }
+}
+
+/// Whether `status` says the call never reached a server: the connection was refused, so nothing
+/// listened at the address and the request went nowhere.
+fn never_delivered(status: &Status) -> bool {
+    let mut cause: Option<&(dyn std::error::Error + 'static)> = std::error::Error::source(status);
+    while let Some(error) = cause {
+        if error
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|error| error.kind() == std::io::ErrorKind::ConnectionRefused)
+        {
+            return true;
+        }
+        cause = error.source();
+    }
+    false
 }

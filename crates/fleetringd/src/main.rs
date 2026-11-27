@@ -1712,6 +1712,7 @@ impl DaemonArgs {
         }
         if self.control.is_some() {
             config.control.address = self.control;
+            config.control.addresses.clear();
         }
         if let Some(role) = self.role {
             config.role = role;

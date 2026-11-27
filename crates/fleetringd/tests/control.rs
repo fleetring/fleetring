@@ -34,6 +34,8 @@ use tokio_stream::Stream;
 
 use crate::support::Tls;
 
+#[path = "control/client.rs"]
+mod client;
 #[path = "control/fixtures.rs"]
 mod fixtures;
 #[path = "control/raft_network.rs"]
@@ -4123,6 +4125,10 @@ mod forks {
 #[derive(Debug, Clone, Default)]
 struct Publishing {
     revocations: Arc<std::sync::Mutex<Vec<fleetring_proto::v1::Revocation>>>,
+    /// The control group its replies name; none, as a control node before 0.10 names.
+    control_nodes: Arc<std::sync::Mutex<Vec<fleetring_proto::v1::ControlNode>>>,
+    /// How many heartbeats it answered.
+    heartbeats: Arc<AtomicU32>,
 }
 
 impl Publishing {
@@ -4132,6 +4138,14 @@ impl Publishing {
 
     fn published(&self) -> Vec<fleetring_proto::v1::Revocation> {
         self.revocations.lock().expect("lock").clone()
+    }
+
+    fn name_group(&self, nodes: Vec<fleetring_proto::v1::ControlNode>) {
+        *self.control_nodes.lock().expect("lock") = nodes;
+    }
+
+    fn group(&self) -> Vec<fleetring_proto::v1::ControlNode> {
+        self.control_nodes.lock().expect("lock").clone()
     }
 }
 
@@ -4148,7 +4162,7 @@ impl Control for Publishing {
             revocations: self.published(),
             protocol: Some(PROTOCOL_VERSION),
             membership_epoch: 1,
-            control_nodes: Vec::new(),
+            control_nodes: self.group(),
         }))
     }
 
@@ -4156,13 +4170,14 @@ impl Control for Publishing {
         &self,
         _: Request<HeartbeatRequest>,
     ) -> Result<Response<HeartbeatResponse>, Status> {
+        self.heartbeats.fetch_add(1, Ordering::SeqCst);
         Ok(Response::new(HeartbeatResponse {
             membership_epoch: 1,
             unknown_databases: Vec::new(),
             revocations: self.published(),
             forks: Vec::new(),
             tombstones: Vec::new(),
-            control_nodes: Vec::new(),
+            control_nodes: self.group(),
         }))
     }
 

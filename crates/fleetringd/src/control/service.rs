@@ -512,6 +512,24 @@ impl ControlService {
 }
 
 impl ControlService {
+    /// The control group's voters and learners, with the leader marked, as join and heartbeat
+    /// replies carry them, so a data node or router can reach the group at any of its addresses
+    /// (ADR-0040 point 12).
+    fn control_nodes(&self) -> Vec<fleetring_proto::v1::ControlNode> {
+        self.node
+            .group_members()
+            .into_iter()
+            .map(|member| fleetring_proto::v1::ControlNode {
+                node_id: member.peer.node_id,
+                address: member.peer.address,
+                voter: member.voter,
+                leader: member.leader,
+                matched_index: member.matched_index,
+                software: member.software.as_ref().map(software_to_proto),
+            })
+            .collect()
+    }
+
     /// Mints a delegated agent's token for `caller` (ADR-0047, point 5), in the order the plan
     /// gives. Every refusal comes before anything is logged, `apply`'s too, which the writer
     /// answers unlogged (`control/node.rs`), and the token reaches no log,
@@ -1594,7 +1612,7 @@ impl Control for ControlService {
                 protocol: Some(PROTOCOL_VERSION),
                 membership_epoch: membership_epoch.get(),
                 revocations: revocations_to_proto(state.revocations()),
-                control_nodes: Vec::new(),
+                control_nodes: self.control_nodes(),
             })),
             (other, _) => Err(unexpected(&other)),
         }
@@ -1655,7 +1673,7 @@ impl Control for ControlService {
             revocations: revocations_to_proto(state.revocations()),
             forks: pending_forks(&state, &id),
             tombstones: tombstones_to_proto(&state, reported.iter().map(String::as_str)),
-            control_nodes: Vec::new(),
+            control_nodes: self.control_nodes(),
         }))
     }
 
