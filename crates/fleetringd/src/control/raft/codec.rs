@@ -19,7 +19,7 @@ use std::fmt;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
-use fleetring_control::Software;
+use fleetring_control::{ControlConfig, Software};
 use openraft::EntryPayload;
 use openraft::impls::leader_id_adv::LeaderId;
 use openraft::raft::{AppendError, AppendResult, ConflictHint, SnapshotResponse};
@@ -66,6 +66,25 @@ pub enum CodecError {
         offset: u64,
         /// The bytes received so far.
         received: u64,
+    },
+    /// An `InstallSnapshot` chunk carries another vote or metadata than the snapshot it would
+    /// continue.
+    #[error("snapshot chunk at offset {offset} belongs to another snapshot or vote")]
+    ChunkMismatch {
+        /// The chunk's offset.
+        offset: u64,
+    },
+    /// An `InstallSnapshot` chunk holds more than one chunk's bytes.
+    #[error("snapshot chunk of {bytes} bytes is larger than a chunk may be")]
+    ChunkTooLarge {
+        /// The chunk's size.
+        bytes: u64,
+    },
+    /// A snapshot being received grew past the most a snapshot may hold.
+    #[error("snapshot is larger than {limit} bytes")]
+    SnapshotTooLarge {
+        /// The cap.
+        limit: u64,
     },
 }
 
@@ -768,6 +787,12 @@ pub struct ProbeReply {
     pub software: Software,
     /// Whether the node's store holds a vote, a log, or a snapshot.
     pub has_raft_state: bool,
+    /// The configuration the node's control state starts from: what `apply` reads besides the
+    /// log. A joiner the leader feeds the log from its first entry replays it from this, so the
+    /// leader refuses a node whose genesis differs from its own. Absent from a node that
+    /// predates the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub genesis: Option<ControlConfig>,
 }
 
 /// Splits a whole snapshot into `InstallSnapshot` chunks of at most `chunk_bytes` bytes each.
@@ -817,9 +842,18 @@ pub struct AssembledSnapshot {
     pub data: Vec<u8>,
 }
 
+/// The most bytes a reassembled snapshot may hold: 1 GiB. A control state that large is far past
+/// anything a fleet keeps, and the cap bounds what a member's chunks can make a receiver hold.
+pub const MAX_SNAPSHOT_BYTES: u64 = 1 << 30;
+
 /// Reassembles a whole snapshot from its `InstallSnapshot` chunks, in order.
+///
+/// The chunk at offset 0 starts a snapshot and fixes its vote and metadata; every later chunk
+/// must carry the same, start where the bytes received end, and hold at most
+/// [`SNAPSHOT_CHUNK_BYTES`]; the whole holds at most [`MAX_SNAPSHOT_BYTES`].
 #[derive(Debug, Default)]
 pub struct SnapshotAssembly {
+    head: Option<(VoteWire, SnapshotMetaWire)>,
     data: Vec<u8>,
 }
 
@@ -830,33 +864,66 @@ impl SnapshotAssembly {
         Self::default()
     }
 
-    /// Adds `chunk`, and returns the whole snapshot once its last chunk has arrived.
+    /// Adds `chunk`, and returns the whole snapshot once its last chunk has arrived. A chunk at
+    /// offset 0 starts the snapshot again.
     ///
     /// # Errors
     ///
     /// [`CodecError::Chunk`] if the chunk doesn't start where the bytes received so far end,
-    /// [`CodecError::Json`] if its data isn't base64, and any error decoding its metadata.
+    /// [`CodecError::ChunkMismatch`] if it carries another vote or metadata than the chunk that
+    /// started the snapshot, [`CodecError::ChunkTooLarge`] or [`CodecError::SnapshotTooLarge`]
+    /// past the caps, [`CodecError::Json`] if its data isn't base64, and any error decoding its
+    /// metadata. After an error, the caller drops the assembly.
     pub fn push(
         &mut self,
         chunk: InstallSnapshotChunk,
     ) -> Result<Option<AssembledSnapshot>, CodecError> {
+        if chunk.offset == 0 {
+            self.head = Some((chunk.vote, chunk.meta.clone()));
+            self.data.clear();
+        }
         let received = u64::try_from(self.data.len()).unwrap_or(u64::MAX);
-        if chunk.offset != received {
+        let started = self.head.as_ref();
+        if chunk.offset != received || started.is_none() {
             return Err(CodecError::Chunk {
                 offset: chunk.offset,
                 received,
             });
         }
-        let bytes = BASE64
+        if started.is_some_and(|(vote, meta)| *vote != chunk.vote || *meta != chunk.meta) {
+            return Err(CodecError::ChunkMismatch {
+                offset: chunk.offset,
+            });
+        }
+        // Base64 holds three bytes in every four characters, less one for each `=` of padding.
+        let padding = chunk
+            .data
+            .bytes()
+            .rev()
+            .take_while(|byte| *byte == b'=')
+            .count();
+        let bytes = (u64::try_from(chunk.data.len()).unwrap_or(u64::MAX) / 4 * 3)
+            .saturating_sub(u64::try_from(padding).unwrap_or(0));
+        let chunk_cap = u64::try_from(SNAPSHOT_CHUNK_BYTES).unwrap_or(u64::MAX);
+        if bytes > chunk_cap {
+            return Err(CodecError::ChunkTooLarge { bytes });
+        }
+        if received.saturating_add(bytes) > MAX_SNAPSHOT_BYTES {
+            return Err(CodecError::SnapshotTooLarge {
+                limit: MAX_SNAPSHOT_BYTES,
+            });
+        }
+        let decoded = BASE64
             .decode(chunk.data.as_bytes())
             .map_err(|error| CodecError::Json {
                 what: "a snapshot chunk's data",
                 source: serde::de::Error::custom(error),
             })?;
-        self.data.extend_from_slice(&bytes);
+        self.data.extend_from_slice(&decoded);
         if !chunk.done {
             return Ok(None);
         }
+        self.head = None;
         Ok(Some(AssembledSnapshot {
             vote: Vote::from(chunk.vote),
             meta: SnapshotMeta::try_from(chunk.meta)?,

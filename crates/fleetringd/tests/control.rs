@@ -36,6 +36,8 @@ use crate::support::Tls;
 
 #[path = "control/fixtures.rs"]
 mod fixtures;
+#[path = "control/raft_network.rs"]
+mod raft_network;
 #[path = "control/store.rs"]
 mod store;
 mod support;
@@ -3578,9 +3580,10 @@ mod node_list {
     /// Guards against a hang only.
     const HANG_GUARD: Duration = Duration::from_secs(30);
 
-    /// A control daemon with three members: `node-a` (live, on 0.3.1, with every attribute),
-    /// `node-b` (live, draining, on the 0.3.0 a member that reports no software runs), and
-    /// `node-c` (down).
+    /// A control daemon with three members: `node-a` (live, on 0.9.1, with every attribute),
+    /// `node-b` (live, draining, on 0.9.0), and `node-c` (down, on 0.9.0). Every release is within
+    /// the window of the control node's, which counts since it is a control group member
+    /// (ADR-0040 point 4).
     struct Fleet {
         _dir: tempfile::TempDir,
         tls: Tls,
@@ -3606,7 +3609,7 @@ mod node_list {
             // node-c joins first and never beats again: it is down once the control plane's
             // time, which the others' heartbeats move on, passes its heartbeat timeout.
             node_client(address, &tls, "node-c")?
-                .join(join_request("node-c"))
+                .join(crate::join_with("node-c", Some(reporting("0.9.0"))))
                 .await?;
             node_client(address, &tls, "node-a")?
                 .join(JoinRequest {
@@ -3617,12 +3620,12 @@ mod node_list {
                         weight: 2,
                         address: Some("10.0.0.1:7400".into()),
                     }),
-                    software: Some(reporting("0.3.1")),
+                    software: Some(reporting("0.9.1")),
                     ..join_request("node-a")
                 })
                 .await?;
             node_client(address, &tls, "node-b")?
-                .join(join_request("node-b"))
+                .join(crate::join_with("node-b", Some(reporting("0.9.0"))))
                 .await?;
             control
                 .drain(DrainRequest {
@@ -3720,11 +3723,11 @@ mod node_list {
                     "2",
                     "live",
                     "no",
-                    "0.3.1"
+                    "0.9.1"
                 ]
                 .to_vec(),
-                ["node-b", "-", "-", "-", "1", "live", "yes", "0.3.0"].to_vec(),
-                ["node-c", "-", "-", "-", "1", "down", "no", "0.3.0"].to_vec(),
+                ["node-b", "-", "-", "-", "1", "live", "yes", "0.9.0"].to_vec(),
+                ["node-c", "-", "-", "-", "1", "down", "no", "0.9.0"].to_vec(),
             ],
             "{printed}"
         );
@@ -3748,7 +3751,7 @@ mod node_list {
                     "weight": 2,
                     "liveness": "live",
                     "draining": false,
-                    "release": "0.3.1",
+                    "release": "0.9.1",
                 },
                 {
                     "node": "node-b",
@@ -3758,7 +3761,7 @@ mod node_list {
                     "weight": 1,
                     "liveness": "live",
                     "draining": true,
-                    "release": "0.3.0",
+                    "release": "0.9.0",
                 },
                 {
                     "node": "node-c",
@@ -3768,7 +3771,7 @@ mod node_list {
                     "weight": 1,
                     "liveness": "down",
                     "draining": false,
-                    "release": "0.3.0",
+                    "release": "0.9.0",
                 },
             ]})
         );

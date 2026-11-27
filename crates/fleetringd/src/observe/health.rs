@@ -142,14 +142,22 @@ impl Probes {
                     .is_none()
                     .then(|| "no control leader known".to_owned()),
             ));
-            checks.push(Check::judged(
-                "control_group",
-                (!control.group().contains(&control.own().node_id)).then(|| {
+            let group = if control.group().contains(&control.own().node_id) {
+                // A joint membership is a voter change openraft didn't finish, as when the leader
+                // changed between its two steps; another `set_voters` finishes it.
+                control.is_joint().then(|| {
+                    "the control group's membership is joint: a change of voters didn't finish; \
+                     run set-voters again"
+                        .to_owned()
+                })
+            } else {
+                Some(
                     "this node is no voter or learner of a control group: it waits to be added, \
                      or was removed"
-                        .to_owned()
-                }),
-            ));
+                        .to_owned(),
+                )
+            };
+            checks.push(Check::judged("control_group", group));
         }
         Readiness {
             ready: checks.iter().all(|check| check.ok),

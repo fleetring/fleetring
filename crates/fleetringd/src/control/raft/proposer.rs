@@ -24,6 +24,7 @@ use std::sync::Arc;
 #[cfg(test)]
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::time::Duration;
 
 use fleetring::NodeId;
 use fleetring_control::delegation::Resent;
@@ -37,11 +38,12 @@ use openraft::type_config::alias::{WatchReceiverOf, WriteResponderOf};
 use openraft::{RaftMetrics, ServerState};
 use tokio::sync::{Notify, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
+use tokio::time::Instant;
 
 use crate::clock::Clock;
 use crate::control::format1::{LogError, LogIndex};
 use crate::control::node::{Committed, SubmitError};
-use crate::control::raft::gate::GroupGate;
+use crate::control::raft::group::GroupGate;
 use crate::control::raft::state_machine::{AppliedState, ControlStateMachine};
 use crate::control::raft::{
     ControlPeer, ControlRequest, ControlResponse, ControlTypes, LeaderRef, RaftId,
@@ -104,14 +106,15 @@ impl Readiness {
 
     /// The error a submission gets while this node isn't a ready leader, naming `own` as the
     /// leader that is catching up.
-    fn refusal(&self, own: &ControlPeer) -> SubmitError {
+    fn refusal(&self) -> SubmitError {
         match self {
             Self::Follower { leader } => SubmitError::NotLeader {
                 leader: leader.as_ref().map(|peer| peer.address.clone()),
             },
-            Self::CatchingUp { .. } | Self::Ready { .. } => SubmitError::CatchingUp {
-                leader: Some(own.address.clone()),
-            },
+            // No hint: it would name this node, and a client would send the call straight back.
+            Self::CatchingUp { .. } | Self::Ready { .. } => {
+                SubmitError::CatchingUp { leader: None }
+            }
         }
     }
 }
@@ -128,6 +131,11 @@ pub(crate) struct ProposerSettings {
     pub(crate) tombstone_window: Millis,
     /// The `[fork]` limits this node records with each fork it accepts, if it knows them.
     pub(crate) fork_limits: Option<ForkLimits>,
+    /// How long a batch may wait for openraft's answer before submissions behind it are refused
+    /// rather than held: four shortest election timeouts.
+    pub(crate) stall_after: Duration,
+    /// The group gate the proposals pass (ADR-0040 point 4).
+    pub(crate) gate: GroupGate,
 }
 
 /// The screening state of a ready leader's term.
@@ -181,9 +189,14 @@ pub(crate) struct Proposer {
     peer: ControlPeer,
     readiness: watch::Sender<Readiness>,
     gate: GroupGate,
+    /// The control group's term this node last saw; a new one forgets what members reported.
+    term: Option<u64>,
     settings: Settings,
     tombstone_window: Millis,
     fork_limits: Option<ForkLimits>,
+    stall_after: Duration,
+    /// When the batch in flight went to openraft.
+    batch_started: Option<Instant>,
     metrics: ControlMetrics,
     in_flight: Arc<AtomicUsize>,
     /// Notified each time a proposal stops counting as in flight.
@@ -243,10 +256,13 @@ impl Proposer {
             clock,
             peer: settings.peer,
             readiness,
-            gate: GroupGate::new(),
+            gate: settings.gate,
+            term: None,
             settings: Settings::new(Some(settings.own), settings.tombstone_window),
             tombstone_window: settings.tombstone_window,
             fork_limits: settings.fork_limits,
+            stall_after: settings.stall_after,
+            batch_started: None,
             metrics,
             in_flight: Arc::clone(&in_flight),
             answered: Arc::new(Notify::new()),
@@ -278,7 +294,20 @@ impl Proposer {
             // One batch in flight: while a ready leader waits for openraft to answer a proposal,
             // submissions wait in the mailbox. A node that isn't a ready leader screens nothing,
             // so it answers them at once, whatever it still waits for.
-            let taking = self.in_flight.load(Ordering::SeqCst) == 0 || self.screening.is_none();
+            let idle = self.in_flight.load(Ordering::SeqCst) == 0;
+            if idle {
+                // Only this task hands batches to openraft, so with nothing in flight every batch
+                // so far has been answered, and changed reports settle.
+                self.gate.group().idle();
+            }
+            let taking = idle || self.screening.is_none();
+            // A batch openraft hasn't answered within four election timeouts, as on a leader cut
+            // off from its quorum that still believes it leads: what queues behind it is refused
+            // at once, unscreened, so clients try another control node rather than wait.
+            let stalled_at = self
+                .batch_started
+                .map_or_else(Instant::now, |started| started + self.stall_after);
+            let stalled = !taking && Instant::now() >= stalled_at;
             tokio::select! {
                 biased;
                 changed = raft_metrics.changed() => {
@@ -294,13 +323,28 @@ impl Proposer {
                     self.refresh(&raft_metrics, &applied);
                 }
                 () = self.answered.notified(), if !taking => {}
+                () = tokio::time::sleep_until(stalled_at), if !taking && !stalled => {}
                 // A stop request queued behind waiting submissions can't be read yet, so a
                 // shutdown also says so here; stopping the group then answers what is in flight.
                 Ok(()) = async { stopping.wait_for(|stop| *stop).await.map(drop) }, if !taking => {
                     break;
                 }
-                mail = inbox.recv(), if taking => {
+                mail = inbox.recv(), if taking || stalled => {
                     let Some(first) = mail else { break };
+                    if stalled {
+                        match first {
+                            Mail::Submit { reply, .. } => {
+                                let refused = SubmitError::CatchingUp { leader: None };
+                                let _unheard = reply.send(Err(refused));
+                                continue;
+                            }
+                            Mail::Stop { done } => {
+                                self.stop().await;
+                                let _unheard = done.send(());
+                                return;
+                            }
+                        }
+                    }
                     let (batch, stop) = gather(first, &mut inbox);
                     if !batch.is_empty() {
                         self.propose(batch, &applied).await;
@@ -348,6 +392,19 @@ impl Proposer {
         let readiness = {
             let metrics = raft_metrics.borrow_watched();
             let term = metrics.current_term;
+            // What members reported belongs to the term it was heard in (ADR-0040 point 4).
+            if self.term != Some(term) {
+                self.term = Some(term);
+                self.gate.group().clear();
+            }
+            self.gate.group().set_members(
+                metrics
+                    .membership_config
+                    .membership()
+                    .nodes()
+                    .map(|(id, peer)| (*id, peer.clone()))
+                    .collect(),
+            );
             let leads = metrics.current_leader == Some(self.own_raft)
                 && metrics.state == ServerState::Leader;
             if leads {
@@ -449,7 +506,7 @@ impl Proposer {
         if !self.usable(applied) {
             let readiness = self.readiness.borrow().clone();
             for (_, _, reply) in batch {
-                let _unheard = reply.send(Err(readiness.refusal(&self.peer)));
+                let _unheard = reply.send(Err(readiness.refusal()));
             }
             return;
         }
@@ -521,6 +578,8 @@ impl Proposer {
         if writes.is_empty() {
             return;
         }
+        self.gate.group().proposing();
+        self.batch_started = Some(Instant::now());
         let expected = LeaderId {
             term: leader.term,
             node_id: leader.node,
@@ -1106,10 +1165,10 @@ mod tests {
             .expect("opens");
         let handle = node.handle();
         handle.faults().supersede.store(1, Ordering::SeqCst);
-        let first = handle.submit(join("old", Release::new(0, 9, 0))).await;
+        let first = handle.submit(join("old", Release::new(0, 8, 0))).await;
         assert!(matches!(first, Err(SubmitError::Superseded)), "{first:?}");
         let second = handle
-            .submit(join("far", Release::new(0, 11, 0)))
+            .submit(join("far", Release::new(0, 10, 0)))
             .await
             .expect("commits");
         assert!(second.outcome().is_ok(), "{:?}", second.outcome());
@@ -1140,14 +1199,14 @@ mod tests {
         handle.faults().hold.store(true, Ordering::SeqCst);
         let first = {
             let handle = handle.clone();
-            tokio::spawn(async move { handle.submit(join("old", Release::new(0, 9, 0))).await })
+            tokio::spawn(async move { handle.submit(join("old", Release::new(0, 8, 0))).await })
         };
         while handle.in_flight() == 0 {
             tokio::task::yield_now().await;
         }
         let second = {
             let handle = handle.clone();
-            tokio::spawn(async move { handle.submit(join("far", Release::new(0, 11, 0))).await })
+            tokio::spawn(async move { handle.submit(join("far", Release::new(0, 10, 0))).await })
         };
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         assert!(
@@ -1169,6 +1228,77 @@ mod tests {
             })
             .collect();
         assert_eq!(joined, ["far"]);
+    }
+
+    /// A batch openraft hasn't answered within four election timeouts stalls the proposer: what
+    /// queues behind it is answered `CatchingUp` without a leader to name, unscreened, and once
+    /// the batch is answered the proposer screens again.
+    #[tokio::test(start_paused = true)]
+    async fn submissions_behind_a_stalled_batch_are_refused_at_once() {
+        let dir = tempfile::tempdir().expect("a directory");
+        let node = open_node(
+            dir.path().join("control.db"),
+            options(),
+            SimClock::new(Timestamp::ZERO),
+        )
+        .await
+        .expect("opens");
+        let handle = node.handle();
+        handle.faults().hold.store(true, Ordering::SeqCst);
+        let first = {
+            let handle = handle.clone();
+            tokio::spawn(async move { handle.submit(Action::Tick).await })
+        };
+        while handle.in_flight() == 0 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        let refused = handle.submit(Action::Tick).await;
+        assert!(
+            matches!(refused, Err(SubmitError::CatchingUp { leader: None })),
+            "{refused:?}"
+        );
+        handle.faults().hold.store(false, Ordering::SeqCst);
+        handle.faults().release.notify_one();
+        first.await.expect("joins").expect("the held tick commits");
+        handle.submit(Action::Tick).await.expect("screens again");
+        node.shutdown().await;
+    }
+
+    /// A shutdown while a batch is held stops the proposer anyway: the held submitter, and one
+    /// queued behind it, are answered, and the shutdown returns.
+    #[tokio::test(start_paused = true)]
+    async fn a_shutdown_while_a_batch_is_held_answers_everyone() {
+        let dir = tempfile::tempdir().expect("a directory");
+        let node = open_node(
+            dir.path().join("control.db"),
+            options(),
+            SimClock::new(Timestamp::ZERO),
+        )
+        .await
+        .expect("opens");
+        let handle = node.handle();
+        handle.faults().hold.store(true, Ordering::SeqCst);
+        let held = {
+            let handle = handle.clone();
+            tokio::spawn(async move { handle.submit(Action::Tick).await })
+        };
+        while handle.in_flight() == 0 {
+            tokio::task::yield_now().await;
+        }
+        let queued = {
+            let handle = handle.clone();
+            tokio::spawn(async move { handle.submit(Action::Tick).await })
+        };
+        tokio::task::yield_now().await;
+        tokio::time::timeout(std::time::Duration::from_secs(5), node.shutdown())
+            .await
+            .expect("the shutdown returns");
+        handle.faults().release.notify_one();
+        let queued = queued.await.expect("joins");
+        assert!(matches!(queued, Err(SubmitError::Stopped)), "{queued:?}");
+        // The held one was answered by its entry or by the group stopping.
+        let _answered = held.await.expect("joins");
     }
 
     /// Commands reach the log in the order the proposer screened them: by index, their stamps

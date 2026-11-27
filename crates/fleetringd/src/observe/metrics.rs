@@ -560,10 +560,6 @@ impl ControlMetrics {
     }
 
     /// The largest clock offset seen in the control group's messages, in seconds.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the Raft network measures offsets from PR 4")
-    )]
     pub(crate) fn clock_offset(&self, seconds: f64) {
         self.clock_offset_max.set(seconds);
     }

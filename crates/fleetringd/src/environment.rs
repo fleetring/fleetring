@@ -252,6 +252,9 @@ pub struct Environment {
     /// The free space and size of the data volume a simulated node believes it has, in bytes;
     /// `None` reads the real volume.
     simulated_disk: Option<(u64, u64)>,
+    /// The software a control node reports to its group: this build's, unless a test or a
+    /// simulation stands it in for another release's.
+    software: Option<fleetring_control::Software>,
 }
 
 impl Environment {
@@ -268,6 +271,7 @@ impl Environment {
             fork_faults: ForkFaults::default(),
             incarnation_rule: IncarnationRule::Always,
             simulated_disk: None,
+            software: None,
         }
     }
 
@@ -292,6 +296,7 @@ impl Environment {
             fork_faults: ForkFaults::default(),
             incarnation_rule: IncarnationRule::Always,
             simulated_disk: Some((SIMULATED_DISK_FREE, 2 * SIMULATED_DISK_FREE)),
+            software: None,
         }
     }
 
@@ -379,6 +384,24 @@ impl Environment {
     /// `None` to read the real volume.
     pub(crate) fn simulated_disk(&self) -> Option<(u64, u64)> {
         self.simulated_disk
+    }
+
+    /// Reports `software` to the control node's group instead of this build's, as a node of
+    /// another release would: for tests and simulations of a control group whose members run
+    /// different releases (ADR-0040 point 4). The fleet's members still report this build's.
+    #[must_use]
+    pub fn with_software(mut self, software: fleetring_control::Software) -> Self {
+        self.software = Some(software);
+        self
+    }
+
+    /// The software a control node reports to its group: this build's, unless
+    /// [`Environment::with_software`] replaced it.
+    #[must_use]
+    pub fn software(&self) -> fleetring_control::Software {
+        self.software
+            .clone()
+            .unwrap_or_else(crate::software::running)
     }
 
     /// The rule a control node logs database creations under.

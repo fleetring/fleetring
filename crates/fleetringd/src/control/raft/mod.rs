@@ -20,8 +20,9 @@
 //!
 //! - **The pieces.** `log_storage` and `state_machine` implement openraft's storage traits over
 //!   [`ControlStore`](crate::control::ControlStore); `proposer` screens, stamps, and proposes on
-//!   the leader; `gate` is the group gate ([`GroupGate`]); `network` is the group's network,
-//!   which carries no Raft message yet, so a group has one voter.
+//!   the leader; `group` keeps what the group's members report of their software and is the
+//!   group gate ([`GroupGate`]); `network` carries openraft's messages to the other members as
+//!   FleetRing's JSON over the `Raft` gRPC service, and `service` answers them.
 //!
 //! # openraft 0.10.1's interfaces
 //!
@@ -64,16 +65,17 @@
 //!   as a second type parameter: `Raft<C, SM>`.
 
 pub mod codec;
-pub(crate) mod gate;
+pub(crate) mod group;
 mod id;
 pub(crate) mod log_storage;
 pub(crate) mod network;
 pub(crate) mod proposer;
 pub(crate) mod runtime;
+pub(crate) mod service;
 pub(crate) mod state_machine;
 mod types;
 
-pub use gate::GroupGate;
+pub use group::{GroupGate, GroupSoftware};
 pub use id::{ParseRaftIdError, RaftIdError, check_raft_id, parse_raft_id, raft_id, raft_id_text};
 pub use proposer::Readiness;
 pub use runtime::{ControlInstant, ControlRng, ControlRuntime, RaftSeed};

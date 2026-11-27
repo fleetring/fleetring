@@ -242,6 +242,14 @@ fn vectors() -> Vec<Vector> {
                 (pretty(&wire), wire == probe())
             }),
         },
+        Vector {
+            name: "probe-reply-genesis.json",
+            encode: Box::new(|| pretty(&probe_with_genesis())),
+            round_trip: Box::new(|text| {
+                let wire: ProbeReply = serde_json::from_str(text).expect("the vector decodes");
+                (pretty(&wire), wire == probe_with_genesis())
+            }),
+        },
     ]
 }
 
@@ -252,6 +260,17 @@ fn probe() -> ProbeReply {
             .with_feature(Feature::Handover)
             .with_feature(Feature::Delegation),
         has_raft_state: false,
+        genesis: None,
+    }
+}
+
+fn probe_with_genesis() -> ProbeReply {
+    ProbeReply {
+        genesis: Some(
+            fleetring_control::ControlConfig::new()
+                .with_lease_duration(fleetring_control::Millis::new(4_000)),
+        ),
+        ..probe()
     }
 }
 
@@ -454,6 +473,41 @@ fn a_whole_snapshot_splits_into_chunks_and_reassembles() {
     assert!(matches!(
         assembly.push(chunks[1].clone()),
         Err(CodecError::Chunk { received: 0, .. })
+    ));
+
+    // A chunk of another vote or snapshot doesn't continue one in progress, and a later chunk at
+    // offset 0 starts the snapshot over.
+    let mut assembly = SnapshotAssembly::new();
+    assert!(
+        assembly
+            .push(chunks[0].clone())
+            .expect("the first")
+            .is_none()
+    );
+    let mut other = chunks[1].clone();
+    other.vote = VoteWire::from(&committed_vote(4, LEADER));
+    assert!(matches!(
+        assembly.push(other),
+        Err(CodecError::ChunkMismatch { .. })
+    ));
+    let mut assembly = SnapshotAssembly::new();
+    let mut whole = None;
+    for chunk in [chunks[0].clone(), chunks[0].clone()]
+        .into_iter()
+        .chain(chunks[1..].iter().cloned())
+    {
+        whole = assembly
+            .push(chunk)
+            .expect("a restart at offset 0 is accepted");
+    }
+    assert_eq!(whole.expect("complete").data, data);
+
+    // A chunk larger than a chunk may be is refused.
+    let mut oversized = chunks[0].clone();
+    oversized.data = BASE64.encode(vec![0_u8; SNAPSHOT_CHUNK_BYTES + 3]);
+    assert!(matches!(
+        SnapshotAssembly::new().push(oversized),
+        Err(CodecError::ChunkTooLarge { .. })
     ));
 
     // An empty snapshot is one empty chunk.
