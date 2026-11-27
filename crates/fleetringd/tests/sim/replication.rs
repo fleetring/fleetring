@@ -131,9 +131,17 @@ fn writes_through_faults(seed: u64) -> Result<Report, Box<dyn Error>> {
     Ok(fleet.finish()?)
 }
 
+/// Besides the heavy scenarios' seeds, the sweep's seed where a write acknowledged in the step
+/// after a kept replica set's release carried the release's time, and was judged by rows read
+/// before it was acknowledged (FR-131).
 #[test]
 fn acknowledged_writes_survive_partitions_and_follower_restarts() {
-    seeds::run(BINARY, &seeds::FIXED_HEAVY, |seed| -> TestResult {
+    let seeds = [
+        seeds::FIXED_HEAVY[0],
+        seeds::FIXED_HEAVY[1],
+        9_238_981_417_708_644_212,
+    ];
+    seeds::run(BINARY, &seeds, |seed| -> TestResult {
         let first = writes_through_faults(seed)?;
         let history = first.history();
         let written = history

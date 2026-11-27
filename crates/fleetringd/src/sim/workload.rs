@@ -882,6 +882,8 @@ pub struct Record {
     client: String,
     invoked_at: Duration,
     completed_at: Duration,
+    /// How many operations finished before it in the whole run.
+    completion: u64,
     operation: Operation,
     outcome: Outcome,
 }
@@ -891,6 +893,13 @@ impl Record {
     #[must_use]
     pub fn id(&self) -> OperationId {
         self.id
+    }
+
+    /// Returns its place in completion order: how many operations of the whole run finished
+    /// before it, those [`History::without_databases`] leaves out included.
+    #[must_use]
+    pub fn completion(&self) -> u64 {
+        self.completion
     }
 
     /// Returns the client that sent the operation.
@@ -1138,13 +1147,16 @@ impl fmt::Display for LeaseObservation {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct History {
     next_id: u64,
+    /// How many operations finished.
+    completions: u64,
     records: Vec<Record>,
     pending: BTreeMap<OperationId, Pending>,
     leases: Vec<LeaseObservation>,
     fork_passes: Vec<ForkPass>,
     fork_transitions: Vec<ForkTransition>,
     fork_markers: Vec<ForkMarkerSeen>,
-    fenced: Vec<FencedSeen>,
+    /// Each one with how many operations had finished when it was seen.
+    fenced: Vec<(FencedSeen, u64)>,
     clock_shifts: Vec<(Duration, u64)>,
 }
 
@@ -1184,9 +1196,11 @@ impl History {
             client: pending.client,
             invoked_at: pending.invoked_at,
             completed_at: at,
+            completion: self.completions,
             operation: pending.operation,
             outcome,
         });
+        self.completions += 1;
     }
 
     /// Records a finished operation in one step, and returns its ID.
@@ -1326,16 +1340,26 @@ impl History {
     }
 
     /// Records that a promotion started in control state, or that a database's replica set
-    /// changed there.
+    /// changed there, after every operation finished so far.
     pub fn observe_fenced(&mut self, seen: FencedSeen) {
-        self.fenced.push(seen);
+        self.fenced.push((seen, self.completions));
     }
 
     /// Returns every promotion the fleet saw start in control state, and every change of a
-    /// replica set it saw, in order.
-    #[must_use]
-    pub fn fenced(&self) -> &[FencedSeen] {
-        &self.fenced
+    /// replica set it saw, in order, each with the operations that had finished when it was
+    /// seen, in completion order.
+    ///
+    /// Those are told apart by the order the history recorded them in, not by time: the fleet
+    /// sees control state between simulation steps, and a host's work in the next step that a
+    /// message delivered at its start woke runs at the same simulated time, so an operation
+    /// that finished after the fleet looked can carry the very time it looked at.
+    pub fn fenced(&self) -> impl Iterator<Item = (&FencedSeen, &[Record])> {
+        self.fenced.iter().map(|(seen, completions)| {
+            let finished = self
+                .records
+                .partition_point(|record| record.completion < *completions);
+            (seen, &self.records[..finished])
+        })
     }
 
     /// Records that a holder's copy of a fork was first seen holding the fork's marker on disk.
@@ -1375,6 +1399,7 @@ impl History {
         };
         Self {
             next_id: self.next_id,
+            completions: self.completions,
             records: self
                 .records
                 .iter()
@@ -1394,7 +1419,7 @@ impl History {
             fenced: self
                 .fenced
                 .iter()
-                .filter(|seen| !names.contains(&seen.database))
+                .filter(|(seen, _)| !names.contains(&seen.database))
                 .cloned()
                 .collect(),
             clock_shifts: self.clock_shifts.clone(),
