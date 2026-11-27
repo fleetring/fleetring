@@ -993,10 +993,12 @@ pub fn acknowledged_writes_replicated(
     Ok(())
 }
 
-/// Checks that every write to one of `databases` that `history` says was acknowledged, at or
-/// before a moment the fleet saw a promotion of its database start, or its replica set change
-/// in control state, was then held by at least the write quorum of the replica set promotions
-/// fence from then on. A promotion fences a quorum Q of that set and adopts the most advanced
+/// Checks that every write to one of `databases` that `history` says was acknowledged before
+/// the fleet saw a promotion of its database start, or its replica set change in control state,
+/// was then held by at least the write quorum of the replica set promotions fence from then on.
+/// "Before" is the history's completion order ([`History::fenced`]), not time: a write
+/// acknowledged in the step after the fleet looked can carry the time it looked at, and the rows
+/// it read then can't hold it yet; the next look, or the last, judges it. A promotion fences a quorum Q of that set and adopts the most advanced
 /// log among it, and W + Q > R, so such a write reaches a fenced member; a write held by fewer
 /// may be lost (ADR-0018, point 4; FR-102). A replica set changes only when control state
 /// releases a kept set, once placement's write quorum holds the log, so the check holds at
@@ -1014,17 +1016,17 @@ pub fn acknowledged_writes_fenced(
     history: &History,
     databases: &BTreeSet<DatabaseName>,
 ) -> Result<(), Violation> {
-    for seen in history.fenced() {
+    for (seen, finished) in history.fenced() {
         if !databases.contains(&seen.database) {
             continue;
         }
-        for record in history.records() {
+        for record in finished {
             let (Operation::Write { database, value }, Some(Ack::Written { .. })) =
                 (record.operation(), record.outcome().ack())
             else {
                 continue;
             };
-            if *database != seen.database || record.completed_at() > seen.at {
+            if *database != seen.database {
                 continue;
             }
             let holders: Vec<&NodeId> = seen
@@ -1600,6 +1602,52 @@ mod tests {
             acknowledged_writes_fenced(&history, &BTreeSet::new()),
             Ok(())
         );
+    }
+
+    /// The seeds of FR-131: a write acknowledged in the step after the fleet saw a replica set
+    /// change carries the time the fleet looked at, but the rows it read then can't hold it. Only
+    /// writes recorded before the change are judged by it; later looks judge the rest.
+    #[test]
+    fn a_write_acknowledged_after_a_change_is_judged_by_a_later_look() {
+        let db: DatabaseName = "db".parse().expect("name");
+        let node = |id: &str| -> NodeId { id.parse().expect("id") };
+        let at = Duration::from_millis(12_501);
+        let changed = |rows: ReplicaRows| crate::sim::workload::FencedSeen {
+            at,
+            database: db.clone(),
+            promotion: None,
+            replica_set: ["n3", "n1", "n2"].iter().map(|id| node(id)).collect(),
+            write_quorum: 2,
+            rows,
+        };
+        let held = |n1: &[i64], n2: &[i64], n3: &[i64]| -> ReplicaRows {
+            [("n1", n1), ("n2", n2), ("n3", n3)]
+                .into_iter()
+                .map(|(host, rows)| (host.to_owned(), rows.iter().copied().collect()))
+                .collect()
+        };
+        let databases = BTreeSet::from([db.clone()]);
+        let (operation, outcome) = written(193);
+        let mut history = History::default();
+        history.record("client", at, at, operation.clone(), outcome.clone());
+        history.observe_fenced(changed(held(&[], &[], &[193])));
+        let violation = acknowledged_writes_fenced(&history, &databases)
+            .expect_err("acknowledged before the change, on one member");
+        assert!(violation.detail().contains("write 193"), "{violation}");
+
+        let mut history = History::default();
+        history.observe_fenced(changed(held(&[], &[], &[193])));
+        history.record("client", at, at, operation, outcome);
+        assert_eq!(acknowledged_writes_fenced(&history, &databases), Ok(()));
+        history.observe_fenced(changed(held(&[], &[193], &[193])));
+        assert_eq!(acknowledged_writes_fenced(&history, &databases), Ok(()));
+        history.observe_fenced(changed(held(&[], &[], &[193])));
+        assert!(
+            acknowledged_writes_fenced(&history, &databases).is_err(),
+            "a later look still judges it"
+        );
+        let filtered = history.without_databases(&BTreeSet::from(["other".parse().expect("name")]));
+        assert!(acknowledged_writes_fenced(&filtered, &databases).is_err());
     }
 
     fn seen(node: &str, at: u64, epoch: u64, seen: LeaseSeen) -> LeaseObservation {
