@@ -785,7 +785,7 @@ pub(super) struct WatcherSession {
 ///
 /// It opens the stream again whenever it ends or fails, and replaces a stream that has been
 /// silent for [`WATCH_IDLE`] with a fresh one, swapping only once the replacement's held leases have
-/// arrived, so that no change falls between two streams.
+/// arrived, and reading the old one until then, so that no change falls between two streams.
 pub(super) async fn run_lease_watcher(session: WatcherSession) -> turmoil::Result {
     let WatcherSession {
         name,
@@ -822,8 +822,25 @@ pub(super) async fn run_lease_watcher(session: WatcherSession) -> turmoil::Resul
                 Ok(Ok(Some(update))) => record_lease_update(&shared, &name, &node, &update),
                 Ok(Ok(None) | Err(_)) => break,
                 Err(_) => {
-                    if let Some(replacement) = open().await {
-                        updates = replacement;
+                    // The silent stream is still read while its replacement opens: a change it
+                    // delivers meanwhile is in the replacement's held leases only as held, and
+                    // would be lost as gained or lost if the stream were dropped unread.
+                    let opening = open();
+                    tokio::pin!(opening);
+                    let mut silent_open = true;
+                    let replacement = loop {
+                        tokio::select! {
+                            replacement = &mut opening => break replacement,
+                            update = updates.next(), if silent_open => match update {
+                                Ok(Some(update)) => record_lease_update(&shared, &name, &node, &update),
+                                Ok(None) | Err(_) => silent_open = false,
+                            },
+                        }
+                    };
+                    match replacement {
+                        Some(replacement) => updates = replacement,
+                        None if !silent_open => break,
+                        None => {}
                     }
                 }
             }

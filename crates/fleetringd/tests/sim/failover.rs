@@ -254,7 +254,13 @@ fn no_acknowledged_write_lost(seed: u64) -> TestResult {
 
 #[test]
 fn no_acknowledged_write_is_lost_across_crashes_partitions_outages_and_flapping() {
-    seeds::run(BINARY, &[1, 2_026], no_acknowledged_write_lost);
+    // 17314856460799243793: node-2 gained its lease while its watcher replaced a silent stream
+    // (FR-132).
+    seeds::run(
+        BINARY,
+        &[1, 2_026, 17_314_856_460_799_243_793],
+        no_acknowledged_write_lost,
+    );
 }
 
 /// While the control node is down for several lease durations, the primary keeps acknowledging
