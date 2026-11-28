@@ -992,3 +992,65 @@ The down-conversion (the old question 2) was dropped (D3). Leader transfer befor
     - Router learning: the router calls only `Locate`, whose reply names no group.
     - Updating a member's address when a control node restarts at another one. The membership keeps the address it was added with. Re-adding a member with a new address would need `Probe` to admit a member's own Raft state, and openraft's `ChangeMembers::SetNodes`.
   - Next: PR 6.
+- 2026-11-28: PR 6 written, in review: simulation groups, router learning, FR-118, and the docs. ADR-0040's amendment 2 is accepted, as the owner merged it with PR 5. Revised the same day after an independent review (no blockers; six should-fix items and nits, all addressed below, and the member move taken out to PR 6b).
+  - **FR-118 (#186), the owner's option A.**
+    - `fleetring_control::fork::actions` takes a typed `Settle` (`Settling` or `Settled`) and stays pure. While settling it withholds only `RetryForkSeed` for `SeederDown` and for `AttemptTimedOut`.
+    - The failover timer drives forks on every tick. Promotions and kept-set releases still wait out the window.
+    - ADR-0040's amendment 3 (proposed) explains why each exempt action is safe on a new leader's state. Kept-set releases have the shape of the now-ungated `ReleaseForkHolders` (a lease holder's report at the lease's and membership's epochs, no liveness, no time), so they stay gated by the owner's choice on FR-118, pending a follow-up, which the amendment says.
+    - The plan's rule that `fleetring-control` doesn't change gives way here to the owner's decision. Only the driver's signature changes; `apply`, `State`, `Command`, and their serde forms don't.
+    - Tests:
+      - a unit test of which causes are withheld;
+      - the timer test, which completes a reported fork within a second of readiness;
+      - a timer test in which a seeder that looks down isn't passed over inside the window and is after it (the review found that a mutation always passing `Settle::Settled` passed every other timer test);
+      - `fork::control_only::a_fork_moves_on_right_after_the_control_node_restarts`, which seeds a fork within 3 s of a restart under a 12 s window and fails with the old gating;
+      - `fork::rows_late::row_20_drain_before_reset`, which assumed every replica holds the fork. The driver now completes as soon as a completion quorum reports, so on seeds 1 and 87 the fork had two holders. The test now waits for the fork's holders.
+  - **Router learning (ADR-0040 amendment 4, proposed).**
+    - `LocateResponse.control_nodes = 2` joins protocol 1.4, which no release has shipped.
+    - The router and the data client learn from it, as data nodes learn from heartbeat replies.
+    - The reply sets only `address` and `leader` in each `ControlNode`: any caller that may read a database sees it, and node IDs, voter flags, matched indexes, and software stay with `DescribeControlGroup` and the `fleet` scope.
+    - The simulation found the router keeping every `Locate` on a control node that had crashed: simulated links stall, and nothing moved the router's client on. A router `Locate` now gives up after 1 s (`LOCATE_LIMIT`, justified in its comment) and moves its client on from the address it was sent to, with the new `ControlClient::advance_from`, so concurrent timeouts move it once rather than round the list back to the hung address.
+  - **`control add` refuses an address another member's record names,** before it probes (`add_refuses_an_address_another_member_holds`).
+  - **Moving a member to a new address is PR 6b's.** PR 6 first moved a member with `control add <member> --address <new>` and openraft's `ChangeMembers::SetNodes`. The review showed the guards too thin: in plaintext, a second `c3` on an empty directory, bootstrapped as its own one-voter group, passed the move, and its openraft core hit a debug assertion (`log_state_reader.rs:25`). A `c3` restored from an older data directory passes every check, nothing checks that the old address stopped answering as `c3`, so a clone and the original can split the `SetNodes` stream, and no Raft request names its target. PR 6b needs:
+    - `Probe` returning the node's membership and last log ID, a membership that must name the leader and the node itself;
+    - a refusal while the old address still answers as the node;
+    - a refusal of an address recorded for another member (done here, for adds);
+    - the target's Raft ID in every Raft request, and a refusal of a mismatch;
+    - a stream that compares the recorded address (`address_of(target)`) with its own on every call, not only after an unreachable status, since openraft keeps replication streams across membership changes.
+  - **The harness.**
+    - `FleetBuilder::control_group(names)` runs several control hosts: the first with `bootstrap = "new"`, the rest `"join"`. Data hosts get every control address, and clients and node clients try them all.
+    - `Fleet::build` forms the group through `AddControlNode` and `SetControlVoters` as the workload principal, from a client host of its own, and waits for `control_converged`.
+    - New: `control_hosts`, `control_leader` (the ready leader in the latest term, so an isolated old leader doesn't count), `control_handle_of`, `control_log_of`, and `await_control_converged`. `control_handle` prefers the latest term's ready leader.
+    - Control hosts in a group record `EventKind::Leader { term, leader }`. Fleets with one control host record none, so their traces don't change. `Replay::Order` still compares only the driver's events: under `Order`, elections aren't reproducible.
+    - **Invariants.**
+      - New: `ControlLogsAgree` (`check::control_logs_agree` over paths, `check::logs_agree` over replays), which compares every covered entry's term and leader, blank and membership entries included, as well as the applied commands, and `OneLeaderPerTerm` (`check::one_leader_per_term`), each with hand-built violations in unit tests.
+      - A crashed control host's log is replayed on its own. Acknowledged operations are checked there only with one control host, since a follower may lag the leader.
+      - `Fleet::finish` replays every control host's log, checks that they agree and that one leader led each term, and checks acknowledged operations on the most complete log (the highest committed index, then one replayed from genesis). It compares the last leader's published state with its own host's replay, and runs the copy, lease, and fork checks on the most complete log.
+      - The checks that need a replay from genesis are skipped, with a trace note, when that log was purged.
+    - **The per-host `SimEntropy` mix was already there.** `host_seed` has mixed each host's name into its seed (FNV-1a) since the fork harness (`b0ee5f0`), so two control hosts never shared a stream. It isn't switched to the XXH3 the ADR names, which would move every pinned seed for no gain. No seed was re-found or replaced, and no trace comparison changed.
+  - **Scenarios** (`tests/sim/control_group.rs`):
+    - `a_leader_crash_under_writes_loses_no_control_command`: a new leader within six shortest election timeouts, and no epoch changed;
+    - `an_isolated_leader_commits_nothing`: the isolated host's committed index doesn't move while it is cut off;
+    - `a_rolling_restart_keeps_the_control_plane`: a new leader within one election timeout of the leader's graceful stop, and no epoch changed;
+    - `the_router_learns_the_control_group_and_finds_a_new_leader`.
+    
+    These run on `FIXED_HEAVY`. On seed 1 alone: `five_control_nodes_survive_two_crashes`, and `a_control_group_seed_replays_the_same_run`, an exact replay of a group's run. Together they take about 20 s of the fixed-seed job, well inside its three-minute budget.
+  - **Not in this PR, for a follow-up before FR-064 closes.** The plan's harness knobs `clock_skew`, `software(host)`, `previous_line` with `Environment::with_decode_filter`, and `log_keep(n)` (Timings already has `log_keep`). The invariants `EveryControlNodeApplies` and `PreviousLineDecidesAlike`. Eight scenarios:
+    - `a_refused_join_never_reaches_a_log_across_leader_changes`;
+    - `a_delegation_resend_across_a_leader_change_is_answered_once_committed`;
+    - `a_mixed_release_group_waits_for_every_voter`;
+    - `skewed_clocks_never_make_two_primaries`;
+    - `a_fleet_grows_from_one_control_node_to_three`, which `tests/control_group.rs` covers on real daemons;
+    - `a_late_learner_catches_up_from_a_control_snapshot`, which PR 4's snapshot test covers on real daemons;
+    - `a_previous_line_voter_decides_alike_from_snapshots`;
+    - `one_hosts_crash_does_not_move_anothers_elections`, which needs election timeouts in the trace.
+    
+    "Every invariant per control host" is met through `ControlLogsAgree` and the checks on the most complete log, not by running each check on each host.
+  - **The rolling-upgrade test** reads the voters with `fleetring control list -o json`, and still checks that `control.db` is format 2. It wasn't run against the 0.9.0 baseline locally; the next nightly runs it.
+  - **Docs:**
+    - the daemon README's "Control group" section;
+    - SECURITY.md's "Control group" section, with PR 4's and PR 5's notes;
+    - the lexicon's Control group, Learner, Voter, Term, and Settle window, and the edits to Control node, Leader, Control log, and Epoch;
+    - every new `[control]` setting in `deploy/fleetringd.toml`;
+    - the roadmap's E5 and E2 lines;
+    - ADR-0017's index row, and a note under ADR-0040 point 1 that the simulation mixes host names with FNV-1a, not XXH3.
+  - **Left for PR 7:** `control_logs_agree` is public in `sim::check`, behind the `simulation` feature; `fleetring-chaos` needs it with that feature on, or moved out of `sim`. Next: PR 7, after the follow-up above.
