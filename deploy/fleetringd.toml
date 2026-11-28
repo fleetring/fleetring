@@ -69,6 +69,29 @@ id = "node-1"
 # A control group's members, in place of `address`: a data node tries them in order, and learns
 # the group from its join and heartbeat replies (ADR-0040). Set one of the two, not both.
 # addresses = ["192.0.2.1:7400", "192.0.2.2:7400", "192.0.2.3:7400"]
+#
+# The control group (ADR-0035, ADR-0040), on a node with `role = "control"` or `"both"`. Set the
+# timings and the tombstone window equally on every control node: the leader fills some commands
+# from its own configuration, and warns at readiness when control state records another value.
+#
+# Whether an empty control log starts a control group with this node as its only voter ("new",
+# the default), or waits for `fleetring control add` to add it to one ("join"). A log that holds
+# anything ignores it.
+# bootstrap = "new"
+#
+# The control group's shortest election timeout; each is drawn up to twice as long. It must
+# leave room for 3 Raft heartbeats, and 2 of the longest must fit in `lease_duration_ms`.
+# election_timeout_ms = 1000
+#
+# How often the control group's leader sends Raft heartbeats.
+# raft_heartbeat_ms = 250
+#
+# How many log entries the control node takes between control snapshots, how many entries it
+# keeps behind the newest one, and how many snapshots it keeps on disk. A learner too far behind
+# catches up from a snapshot.
+# snapshot_every = 1000
+# log_keep = 1000
+# snapshots_retained = 2
 
 # [replication]
 # The replication factor and durability a database gets when `db create` names none (ADR-0023,

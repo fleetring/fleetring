@@ -24,7 +24,7 @@ Every simulation run checked against the guarantees each database promises, and 
 - FR-037 `db list`, `db drop`, per-node status (done in 0.2.0).
 - FR-038: drain a node's primaries before it leaves on a planned stop (done in 0.2.0).
 - [FR-049](https://github.com/fleetring/fleetring/issues/52) backups: S3-compatible base snapshots plus log archiving for point-in-time restore (MVP step 5), as an archive, separate from replicas (ADR-0016, point 3, which calls it a durability sink; ADR-0029; [plan](plans/FR-049-s3-durability-sink.md)). Archives write verifiable segments and base snapshots to S3 or a directory; `db restore` builds a new database from one, and `archive restore` a plain SQLite file with no fleet (done in 0.3.0).
-- Control log compaction and bounded control snapshot retention, in FR-064 (E5).
+- Control log compaction and bounded control snapshot retention: [FR-064](https://github.com/fleetring/fleetring/issues/67) (E5; ADR-0040 point 7).
 - [FR-063](https://github.com/fleetring/fleetring/issues/66): metrics (Prometheus) on a separate admin listener, health and readiness endpoints, JSON logs, and a tracing span per request ([ADR-0034](adr/0034-metrics-health-and-logs.md), accepted; [plan](plans/FR-063-metrics-health-readiness.md)). The admin listener serves `/metrics`, `/healthz`, and `/readyz`, loopback by default and TLS with listed scrapers elsewhere; every request runs in an `rpc` span with a request ID that travels on the calls it causes (done in 0.4.0).
 
 ### E3. Security
@@ -50,7 +50,7 @@ Today's design is sound for about a hundred nodes and tens of thousands of datab
 - Benchmarks at 10,000 databases per node and 1,000 nodes in simulation, recorded in `docs/perf.md`.
 
 ### E5. Control plane availability
-- [FR-064](https://github.com/fleetring/fleetring/issues/67): Raft for the control log with openraft, three or five control nodes, with control snapshots, log compaction, and an upgrade from one control node (ADR-0017 planned it; ADR-0035, accepted, decides what it left open; [plan](plans/FR-064-raft-control-plane.md)).
+- [FR-064](https://github.com/fleetring/fleetring/issues/67): Raft for the control log with openraft, three or five control nodes, with control snapshots, log compaction, and an upgrade from one control node (ADR-0017 planned it; ADR-0035 decides what it left open, and ADR-0040 amends it for versions, formats, and the leader's screen; [plan](plans/FR-064-raft-control-plane.md)).
 - Leader redirects already exist in the client; data nodes keep serving through control outages already.
 
 ### E6. Movement

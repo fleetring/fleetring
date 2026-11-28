@@ -299,6 +299,39 @@ The subcommands take `--control <host:port>`, the address of the node that runs 
 
 `fleetring --help` lists every command, and `fleetring <command> --help` its flags. Until 1.0, `fleetring --config <file>` without `serve`, and `fleetringd --config <file>` as 0.6 ran a node, still run a node, and log a warning that names `fleetring serve`. [`deploy/fleetringd.toml`](https://github.com/fleetring/fleetring/blob/main/deploy/fleetringd.toml) documents the main settings, including a multi-node fleet's.
 
+## Control group
+
+The control log is replicated by a control group of control nodes on Raft (ADR-0035, ADR-0040). One control node is a group of one voter, and needs no setting at all: it elects itself as it starts, and a node started on a 0.9 data directory migrates its `control.db` to the new format, once and for good, before it serves. A group of one has no redundancy: while its control node is down, primaries keep serving, and nothing else moves (ADR-0018, point 6).
+
+**Why three or five.** The group commits a command once a majority of its voters holds it, so three voters survive one failure and five survive two. An even count survives no more failures than the odd count below it, so `control set-voters` refuses one; more than seven is refused too, since each voter adds a replication round to every commit. Learners receive the log without voting, while they catch up.
+
+**`bootstrap`.** A control node's empty log either starts a group with itself as the only voter, `[control] bootstrap = "new"` (the default), or waits to be added to one, `"join"`. Start every node after the first with `"join"` on an empty data directory: `control add` refuses a node whose store holds Raft state, so a node started with the default can't bring a group of its own in.
+
+**Growing from one control node to three.** With `c1` running, start `c2` and `c3` with `role = "control"` (or `"both"`), `[control] bootstrap = "join"`, and certificates for their IDs, then:
+
+```sh
+fleetring control add c2 --address c2.example:7400 --control c1.example:7400
+fleetring control add c3 --address c3.example:7400 --control c1.example:7400
+fleetring control set-voters --voter c1 --voter c2 --voter c3 --control c1.example:7400
+fleetring control list --control c1.example:7400
+```
+
+`control add` probes the node first, refuses one that answers as another node, presents another node's certificate, holds Raft state, runs a release outside the window, lacks an enabled fleet feature, or starts its control state from other timings, and returns once the learner has caught up. `set-voters` refuses a new voter that hasn't caught up or reported its software. Every subcommand prints the group after it: each node, its address, whether it votes or leads, how far the leader knows its log reaches, and its release.
+
+**Replacing a failed control node.** Add a new one, make the voters the survivors and the new node with `set-voters`, remove the failed one with `control remove` (a learner only; it asks first on a terminal), and then, if it also hosted data, `fleetring node remove`. `node remove` refuses a control group member and names these commands, since a dead voter left in the group counts toward every quorum unseen.
+
+**A control node that moved.** The membership keeps the address a control node was added with; a control node that restarts at another address can't yet be moved there. Remove it and add it again at its new address, as for a failed one. `control add` refuses an address the membership already records for another member.
+
+**What data nodes and the router see during an election.** Every `Control` call is answered by the leader; the others redirect with `fleetring-leader`, or answer `UNAVAILABLE` while no leader is known, which clients retry. Data nodes take `[control] addresses`, every control node's, try them in order, and learn the group from join and heartbeat replies; the router and `fleetring db` learn it from `Locate` replies. An election takes one to two election timeouts, about a second by default, and leases outlast it: no primary changes epoch because of an election alone. A new leader starts no promotion, retries no fork for a seeder that looks down or an attempt that looks overdue, and releases no kept replica set until a lease duration plus the failover margin has passed since it became ready, so primaries renew first; forks that its replicas report on move at once. A 0.9 data node knows only its one `[control] address`, so while that control node is down it can't reach the group; upgrading it gives it `addresses`.
+
+**Timings.** `election_timeout_ms` (1,000 by default; each election timeout is drawn up to twice as long) must leave room for three `raft_heartbeat_ms` (250), and two of the longest election timeouts must fit in `lease_duration_ms`; the configuration is refused otherwise, naming the setting. **Compaction:** the group takes a control snapshot every `snapshot_every` entries (1,000), keeps `snapshots_retained` of them (2), and purges its log up to `log_keep` entries (1,000) behind the newest; a learner too far behind catches up from a snapshot.
+
+**Settings to keep equal on every control node** (ADR-0040, point 13): the `[control]` timings, `tombstone_window_ms`, the `[fork]` limits, and `[replication]`'s defaults. The leader fills some commands from its own configuration, so a mismatch changes them with the leader; at readiness it compares those control state records and logs a warning per setting that differs, naming both values. Each control node that may lead holds its own delegation issuer pair (`issuer_cert`, `issuer_key`).
+
+**Rolling upgrades of a group.** Upgrade data nodes first, then the control group: learners, then followers, and the leader last. A leader that stops gracefully, as `fleetring upgrade` restarts it, first hands its leadership to its most caught-up voter, so no election timeout passes without a leader. Pass `--config` to `upgrade` on a control node: it then refuses, before swapping anything, a rollback to a binary that reads a lower control-log format than the node's `control.db`, since the old binary couldn't start on it. The first start on 0.10 is one-way for a control node; restoring a copy of `control.db` taken after the group committed anything can issue lease epochs twice, so don't.
+
+**Clocks.** The leader stamps every command with its clock, so run NTP on control nodes. Skew never affects safety, which comes from epochs and quorums, but a leader whose clock runs ahead can delay failovers after it loses leadership by up to the skew. `fleetring_control_clock_offset_max_seconds` shows the largest offset a leader sees in its group's messages, and it logs a warning past the failover margin.
+
 ## Router
 
 `fleetring router --config <file>` runs the router: a front door that speaks libSQL's Hrana protocol over HTTP, so that unchanged libSQL and Turso clients (`@libsql/client`, the `libsql` crate's remote client, Turso's serverless drivers) reach each database's primary through FleetRing ([ADR-0037](https://github.com/fleetring/fleetring/blob/main/docs/adr/0037-router-hrana-front-door.md)). It is a separate process with its own configuration ([`deploy/router.toml`](https://github.com/fleetring/fleetring/blob/main/deploy/router.toml)) and its own identity: a client certificate for a principal, conventionally `router`, that every data node lists with no scopes and `forward_tokens = true` (see "Principals and scopes" below). It acts only with its callers' tokens. Any number of routers can run, on any machine, behind a load balancer or beside an application.
