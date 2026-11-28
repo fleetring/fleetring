@@ -13,18 +13,19 @@ use std::io;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use fleetring_client::output::{
-    ArchiveReport, ChangeReport, ColumnsReport, DatabaseLocation, DatabaseReport, FleetStatus,
-    LeaseEventReport, MetadataReport, NodeList, NodeReport, NodeStatusReport, OrphanReport,
-    PlacementReport, QueryResult, ReplicaReport, RowChangeReport, SchemaObjectReport, SchemaReport,
-    ServedReport, SinkReport, SnapshotReport, ValueReport, printable,
+    ArchiveReport, ChangeReport, ColumnsReport, ControlGroupReport, ControlNodeReport,
+    DatabaseLocation, DatabaseReport, FleetStatus, LeaseEventReport, MetadataReport, NodeList,
+    NodeReport, NodeStatusReport, OrphanReport, PlacementReport, QueryResult, ReplicaReport,
+    RowChangeReport, SchemaObjectReport, SchemaReport, ServedReport, SinkReport, SnapshotReport,
+    ValueReport, printable,
 };
 use fleetring_control::{DatabaseName, Liveness, ReplicaRole, Timestamp};
 
 use crate::MembershipView;
 use crate::changes::MarkHome;
 use crate::data::{
-    ArchiveDescription, ChangedTransaction, LeaseUpdate, Location, MetadataView, NodeStatus,
-    Orphan, SchemaView,
+    ArchiveDescription, ChangedTransaction, ControlGroupView, LeaseUpdate, Location, MetadataView,
+    NodeStatus, Orphan, SchemaView,
 };
 use crate::dev::DevMode;
 use crate::engine::{Column, ObjectKind, RowCount, RowOperation, Rows, SchemaObject, Value};
@@ -165,6 +166,32 @@ pub fn node_list(view: &MembershipView) -> NodeList {
         .collect();
     nodes.sort_by(|a, b| a.node.cmp(&b.node));
     NodeList { nodes }
+}
+
+/// The control group as `control list`, `control add`, `control set-voters` and `control
+/// remove` report it.
+#[must_use]
+pub fn control_group(view: &ControlGroupView) -> ControlGroupReport {
+    ControlGroupReport {
+        nodes: view
+            .members
+            .iter()
+            .map(|member| ControlNodeReport {
+                node: member.node.clone(),
+                address: member.address.clone(),
+                voter: member.voter,
+                leader: member.leader,
+                matched_index: member.matched_index,
+                release: member
+                    .software
+                    .as_ref()
+                    .map(|software| software.release().to_string()),
+            })
+            .collect(),
+        term: view.term,
+        committed_index: view.committed_index,
+        joint: view.joint,
+    }
 }
 
 /// One database and where it lives, as `db locate` and `db list` print it in JSON.
@@ -375,6 +402,42 @@ pub fn node_list_text(list: &NodeList) -> String {
             "NODE", "ADDRESS", "ZONE", "HOST", "WEIGHT", "LIVENESS", "DRAINING", "RELEASE",
         ],
         &rows,
+    )
+}
+
+/// `control list`'s table: `NODE ADDRESS VOTER LEADER MATCHED VERSION`, then the term and the
+/// committed index, and a line saying so when the membership is joint.
+#[must_use]
+pub fn control_group_text(report: &ControlGroupReport) -> String {
+    let yes_no = |flag: bool| if flag { "yes" } else { "no" }.to_owned();
+    let rows: Vec<[String; 6]> = report
+        .nodes
+        .iter()
+        .map(|node| {
+            [
+                printable(&node.node),
+                printable(&node.address),
+                yes_no(node.voter),
+                yes_no(node.leader),
+                node.matched_index.to_string(),
+                node.release.clone().unwrap_or_else(|| "-".to_owned()),
+            ]
+        })
+        .collect();
+    let joint = if report.joint {
+        "the membership is joint: a change of voters didn't finish; run `control set-voters` \
+         again\n"
+    } else {
+        ""
+    };
+    format!(
+        "{}term {}, committed index {}\n{joint}",
+        table(
+            ["NODE", "ADDRESS", "VOTER", "LEADER", "MATCHED", "VERSION"],
+            &rows,
+        ),
+        report.term,
+        report.committed_index
     )
 }
 

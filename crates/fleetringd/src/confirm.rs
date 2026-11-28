@@ -201,6 +201,22 @@ pub(crate) fn remove_node(id: &str, place: &Place) -> Prompt {
     }
 }
 
+/// What `control remove` asks.
+pub(crate) fn remove_control_node(id: &str, place: &Place) -> Prompt {
+    Prompt {
+        question: format!(
+            "remove node '{id}' from the control group {}? its Raft calls are refused from then on.",
+            place.on()
+        ),
+        expect: Expect::Typed {
+            what: "the node ID",
+            value: id.to_owned(),
+        },
+        refusal: format!("pass --yes to remove {id} without a prompt"),
+        declined: format!("not removing {id}"),
+    }
+}
+
 /// What `token revoke --key-id` asks: every token the key signed stops working, for good.
 pub(crate) fn revoke_key(key_id: &str, place: &Place) -> Prompt {
     Prompt {

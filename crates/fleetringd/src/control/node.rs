@@ -532,6 +532,12 @@ const STALL_ELECTIONS: u32 = 4;
 /// change waits to commit.
 const CATCH_UP_LIMIT: Duration = Duration::from_secs(60);
 
+/// The longest a leader waits within one change of the control group: an add's probe and
+/// certificate check, 10 s each, then its catch-up, 60 s, or a change of voters' commit and then
+/// its hand-over, with room for an election timeout of up to 20 s. A client that waits less for
+/// the answer can't tell how the change ended.
+pub const GROUP_CHANGE_WAIT: Duration = Duration::from_secs(100);
+
 /// A cheap, cloneable handle that submits commands to the control node and reads its state.
 #[derive(Clone)]
 pub struct ControlHandle {

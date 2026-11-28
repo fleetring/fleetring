@@ -4,7 +4,7 @@
 .SH NAME
 fleetring\-upgrade \- Installs another release in place of this binary
 .SH SYNOPSIS
-\fBfleetring upgrade\fR [\fB\-\-version\fR] [\fB\-\-check\fR] [\fB\-\-no\-restart\fR] [\fB\-\-rollback\fR] [\fB\-\-base\-url\fR] [\fB\-\-releases\-url\fR] [\fB\-\-timeout\fR] [\fB\-\-software\fR] [\fB\-\-yes\fR] [\fB\-\-control\fR] [\fB\-\-config\fR] [\fB\-\-context\fR] [\fB\-\-tls\-dir\fR] [\fB\-\-ca\fR] [\fB\-\-cert\fR] [\fB\-\-key\fR] [\fB\-\-as\fR] [\fB\-\-insecure\-plaintext\fR] [\fB\-\-log\-format\fR] [\fB\-\-token\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-\-token\-file\fR] [\fB\-\-agent\fR] [\fB\-\-color\fR] [\fB\-h\fR|\fB\-\-help\fR] 
+\fBfleetring upgrade\fR [\fB\-\-version\fR] [\fB\-\-check\fR] [\fB\-\-no\-restart\fR] [\fB\-\-rollback\fR] [\fB\-\-base\-url\fR] [\fB\-\-releases\-url\fR] [\fB\-\-timeout\fR] [\fB\-\-software\fR] [\fB\-\-yes\fR] [\fB\-\-control\fR] [\fB\-\-config\fR] [\fB\-\-context\fR] [\fB\-\-tls\-dir\fR] [\fB\-\-ca\fR] [\fB\-\-cert\fR] [\fB\-\-key\fR] [\fB\-\-as\fR] [\fB\-\-insecure\-plaintext\fR] [\fB\-\-token\fR] [\fB\-\-log\-format\fR] [\fB\-\-token\-file\fR] [\fB\-\-agent\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-\-color\fR] [\fB\-h\fR|\fB\-\-help\fR] 
 .SH DESCRIPTION
 Installs another release in place of this binary
 .PP
@@ -97,20 +97,15 @@ Uses `client.<principal>.crt` and `client.<principal>.key` under the TLS directo
 \fB\-\-insecure\-plaintext\fR
 Connects in plaintext, to a daemon started with `\-\-insecure\-plaintext`
 .TP
-\fB\-\-log\-format\fR \fI<LOG_FORMAT>\fR
-Writes log lines as `text` or `json`
-
-Overrides `FLEETRING_LOG_FORMAT` and the configuration file\*(Aqs `[log] format`.
-.TP
 \fB\-\-token\fR \fI<TOKEN>\fR
 A bearer token from `token issue`, sent with every request
 
 The request then acts with the token\*(Aqs scopes. Defaults to `FLEETRING_TOKEN`, if set.
 .TP
-\fB\-q\fR, \fB\-\-quiet\fR
-Prints the result and errors only
+\fB\-\-log\-format\fR \fI<LOG_FORMAT>\fR
+Writes log lines as `text` or `json`
 
-No progress, notes, warnings or override warnings. A command with no result then prints nothing.
+Overrides `FLEETRING_LOG_FORMAT` and the configuration file\*(Aqs `[log] format`.
 .TP
 \fB\-\-token\-file\fR \fI<PATH>\fR
 A file that holds a bearer token, or `\-` for stdin
@@ -122,22 +117,15 @@ Acts as the agent with this ID, with the identity minted for it
 
 The identity `fleetring agent add` or `fleetring mcp \-\-agent` minted: `agent\-<id>`, its certificate, and its token, from its directory under the context\*(Aqs agents directory. A delegated agent\*(Aqs ID, such as `42.c7`, uses its root agent\*(Aqs certificate, `agent\-42`\*(Aqs, with the token `fleetring agent delegate` wrote for it. Defaults to `FLEETRING_AGENT`.
 .TP
-\fB\-\-color\fR \fI<COLOR>\fR [default: auto]
-When to colour log lines and the picker
+\fB\-q\fR, \fB\-\-quiet\fR
+Prints the result and errors only
 
-`auto` colours on a terminal unless `NO_COLOR` is set or `TERM` is `dumb`; `always` and `never` do as they say.
-.br
+No progress, notes, warnings or override warnings. A command with no result then prints nothing.
+.TP
+\fB\-\-color\fR \fI<COLOR>\fR
+When to colour log lines and the picker: auto, always, or never
 
-.br
-\fIPossible values:\fR
-.RS 14
-.IP \(bu 2
-auto: On a terminal, unless `NO_COLOR` is set or `TERM` is `dumb`
-.IP \(bu 2
-always: Always, even into a pipe or a file
-.IP \(bu 2
-never: Never
-.RE
+`auto`, the default, colours on a terminal unless `NO_COLOR` is set or `TERM` is `dumb`; `always` and `never` do as they say.
 .TP
 \fB\-h\fR, \fB\-\-help\fR
 Print help (see a summary with \*(Aq\-h\*(Aq)

@@ -32,6 +32,8 @@ const _: () = {
     assert_debug_send_sync::<output::DatabaseList>();
     assert_debug_send_sync::<output::DatabaseLocation>();
     assert_debug_send_sync::<output::DatabaseReport>();
+    assert_debug_send_sync::<output::ControlGroupReport>();
+    assert_debug_send_sync::<output::ControlNodeReport>();
     assert_debug_send_sync::<output::FleetStatus>();
     assert_debug_send_sync::<output::LeaseEventReport>();
     assert_debug_send_sync::<output::MetadataReport>();

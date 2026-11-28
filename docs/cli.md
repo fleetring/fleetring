@@ -52,6 +52,7 @@ Groups are the headings `fleetring -h` prints them under (§9).
 | | `db fork <source> <target> [--operation-id <id>] [--detach]` | Makes a new database from another's current contents, and waits until it is ready (ADR-0046, §15) |
 | Fleet | `status [--node <id> \| --address <host:port>]` | Gives the fleet overview, or one data node's view |
 | | `node list \| drain \| undrain \| remove` | Members, with liveness, release, and drain state |
+| | `control add \| set-voters \| remove \| list` | The control group: its voters and learners, the leader, the term, and the committed index (ADR-0040) |
 | | `orphan list \| remove` | Copies a data node keeps that the control plane doesn't know (ADR-0042, ADR-0050) |
 | | `upgrade [--check \| --rollback \| --version <v>]` | Installs another release in place, once the release's `serve --check` accepts the node's configuration (ADR-0038) |
 | | `lease watch` | Follows the leases a data node holds |
@@ -65,7 +66,7 @@ Groups are the headings `fleetring -h` prints them under (§9).
 
 ### Nouns, verbs and top-level commands
 
-- **Nouns** are lexicon terms, singular: `db`, `node`, `cert`, `token`, `lease`, `context`, `agent`, `archive`, `orphan`. `db` is the one abbreviation, and stays because it is short and universal.
+- **Nouns** are lexicon terms, singular: `db`, `node`, `control`, `cert`, `token`, `lease`, `context`, `agent`, `archive`, `orphan`. `control` is the control group's noun: `control add` adds a learner, `control set-voters` chooses the voters, `control remove` removes a learner, and `control list` lists them. `db` is the one abbreviation, and stays because it is short and universal.
 - **Verbs** come from a small set, reused across nouns:
 
   | Verb | Means | Destructive |
@@ -75,6 +76,7 @@ Groups are the headings `fleetring -h` prints them under (§9).
   | `create`, `add`, `issue`, `init` | make something new | no |
   | `edit` | change an item's settings, any number at once (`db edit`: description, labels, expiry, durability) | no |
   | `use` | make an item the current one (`context use`) | no |
+  | `set-voters` | make exactly these control nodes the control group's voters (`control set-voters`) | no; warns when it leaves one voter |
   | `renew` | reissue an item's credentials before they expire (`agent renew`) | no |
   | `delegate` | get a narrower, shorter-lived credential for a child, as its parent (`agent delegate`) | no |
   | `watch` | follow a stream until interrupted | no |
@@ -194,6 +196,7 @@ PS1='$(fleetring context current) $ '
   | `status` | `dev_mode`, `membership_epoch`, `ring_fingerprint`, and `members`, each as `node list` prints a node |
   | `status --node`, `status --address` | `node`, `membership_epoch`, `ring_fingerprint`; `databases`, each `database`, `role`, `lease_epoch` and `position`; `orphans`, each as `orphan list` prints one; `sinks`, each `sink`, `database`, `position`, `mark` (`replicated` or `local`), `acknowledged`, `backlog`, `failures`, `resets` and `last_error` |
   | `node list` | `nodes`, each `node`, `address`, `zone`, `host`, `weight`, `liveness`, `draining` and `release` |
+  | `control list`, `control add`, `control set-voters`, `control remove` | `nodes`, each `node`, `address`, `voter`, `leader`, `matched_index` and `release`; `term`, `committed_index` and `joint` |
   | `db locate` | `database`; `placement`: `engine`, `lease_epoch`, `replication_factor`, `acks`, `min_replicas`, `primary`, `candidate`, `followers`, `replicas`, each `node`, `address`, `liveness`, `reported_role` and `position`, and `placed_replicas`, where the ring places the database while that differs from `replicas` (a membership change kept the replica set, or a ready fork keeps its holders, until the hand-over; ADR-0031, amendment 2), else `null`; `metadata`, as `db show` prints it, or `null` |
   | `db list` | `databases`, each as `db locate` prints one, by name. The description's text is left out |
   | `db show` | `db locate`'s fields, with `metadata`: `description`, `description_by`, `labels`, `created_by`, `created_at`, `expires_at`, `expires_in_ms` and `version`; `schema`: `objects`, each `kind`, `name`, `table`, `definition`, `rows` and `rows_at_least`, and `truncated`; and `schema_unavailable` |
@@ -650,4 +653,5 @@ As of 0.8.0, every rule below is built. The table keeps where 0.6.0 stood, befor
 | `db watch` | None; change streams reach only configured sinks. | Done in 0.8.0 (FR-075 item 7, ADR-0045): `db watch <db> [--from <position>]`, with `jsonl`. |
 | `db fork` | None. | Done in 0.8.0 (FR-086, ADR-0046): `db fork <source> <target>`, fork status in `db show` and `db list`, cancellation by `db drop`, and MCP `db_fork` (§15). |
 | `router` | None; applications speak the gRPC `Database` service. | Done in 0.8.0 (FR-066, ADR-0037): `router --config <file>` under "Getting started". |
+| Control group commands | None; one control node, replaced only with downtime. | Done (FR-064, ADR-0040): `control add`, `set-voters`, `remove`, `list`. `control remove` asks on a terminal and exits 2 without one unless `--yes`; `set-voters` with one voter warns `a control group of one voter has no redundancy`. |
 | Delegation | None; only the authority's key mints a token. | Done in 0.8.0 (FR-090 to FR-093, ADR-0047): `cert issuer`, `agent delegate`, children under `--agent`, lineage in `agent list` and `agent show`, `agent renew` and `agent remove` for children, and `token revoke --principal` with the ancestor rule (§16). |

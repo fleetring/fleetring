@@ -23,6 +23,7 @@ Databases:
 Fleet:
   status       Shows the fleet's members and ring, or one data node's view
   node         Lists, drains, undrains, and removes the fleet's members
+  control      Adds, lists, and removes control nodes, and sets the voters
   orphan       Lists and removes orphans: copies the control plane doesn't know
   upgrade      Installs another release in place of this binary
   lease        Follows the leases data nodes hold
@@ -41,8 +42,7 @@ Recovery:
 Options:
       --log-format <LOG_FORMAT>  Writes log lines as `text` or `json`
   -q, --quiet                    Prints the result and errors only
-      --color <COLOR>            When to colour log lines and the picker [default: auto] [possible
-                                 values: auto, always, never]
+      --color <COLOR>            When to colour log lines and the picker: auto, always, or never
   -h, --help                     Print help (see more with '--help')
   -V, --version                  Print version
 
