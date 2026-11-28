@@ -1745,6 +1745,7 @@ impl Client {
                 database: name.to_string(),
             })
             .await?;
+        self.control.learn(&response.control_nodes);
         placement_of(response.placement)
     }
 

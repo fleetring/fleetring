@@ -17,6 +17,14 @@ use tonic::Status;
 use crate::control::ControlClient;
 use crate::transport::Credentials;
 
+/// How long one `Locate` may take before the router gives it up and moves on to the next control
+/// address it knows. A healthy leader answers after one `ReadIndex` round, a Raft heartbeat
+/// round trip (250 ms between heartbeats by default), so a second is four heartbeat intervals.
+/// Opening a session retries a locate that timed out for its `open_retry` (5 s by default), so a
+/// second also lets it try several control addresses before it gives up. A locate the limit cuts
+/// short only costs a retry, never a wrong answer.
+const LOCATE_LIMIT: Duration = Duration::from_secs(1);
+
 /// The primaries of recently used databases.
 #[derive(Debug)]
 pub(crate) struct PlacementCache {
@@ -67,14 +75,29 @@ impl PlacementCache {
         if let Some(primary) = self.fresh(database) {
             return Ok(Some(primary));
         }
-        let located = control
-            .locate_as(
-                LocateRequest {
-                    database: database.to_string(),
-                },
-                credentials,
-            )
-            .await?;
+        // The address this call starts at: only a timeout there moves the client on, so that
+        // concurrent timeouts move it once, not round the list back to the hung address.
+        let asked = control.leader();
+        let locate = control.locate_as(
+            LocateRequest {
+                database: database.to_string(),
+            },
+            credentials,
+        );
+        let located = match tokio::time::timeout(LOCATE_LIMIT, locate).await {
+            Ok(located) => located?,
+            Err(_elapsed) => {
+                // A control node that hangs, or that crashed behind a link that stalls, keeps
+                // every call; the next one goes to the next address the router knows.
+                control.advance_from(&asked);
+                return Err(Status::deadline_exceeded(
+                    "the control plane didn't answer in time",
+                ));
+            }
+        };
+        // The control group's addresses, so the router reaches it while the one it was
+        // configured with is down (ADR-0040 point 12).
+        control.learn(&located.control_nodes);
         let placement = located
             .placement
             .ok_or_else(|| Status::internal("the control plane sent no placement"))?;

@@ -870,15 +870,25 @@ impl ControlHandle {
     /// # Errors
     ///
     /// [`GroupError::NotLeader`] off the ready leader, [`GroupError::Probe`] when the probe
-    /// refuses the node, [`GroupError::Invalid`] for a node already a member or whose Raft ID
-    /// collides with a member's, [`GroupError::CatchingUp`] when the learner hasn't caught up
-    /// within a minute, and [`GroupError::Refused`] or [`GroupError::Stopped`] from openraft.
+    /// refuses the node, [`GroupError::Invalid`] for a node already a member, an address the
+    /// membership records for another member, or a node whose Raft ID collides with a member's,
+    /// [`GroupError::CatchingUp`] when the learner hasn't caught up within a minute, and
+    /// [`GroupError::Refused`] or [`GroupError::Stopped`] from openraft.
     pub async fn add_node(&self, node: &str, address: &str) -> Result<(), GroupError> {
         let raft = self.leading()?;
         let peers = self.group_peers();
         if peers.iter().any(|peer| peer.node_id == node) {
             return Err(GroupError::Invalid {
                 reason: format!("node '{node}' is already a member of the control group"),
+            });
+        }
+        if let Some(other) = peers.iter().find(|peer| peer.address == address) {
+            return Err(GroupError::Invalid {
+                reason: format!(
+                    "the control group records {address} for member '{}'; a node is added at an \
+                     address of its own",
+                    other.node_id
+                ),
             });
         }
         let id = check_raft_id(node, peers.iter().map(|peer| peer.node_id.as_str())).map_err(
@@ -891,53 +901,11 @@ impl ControlHandle {
             reason,
         };
         let state = self.state();
-        let reply = match self.network.probe(address, PROBE_LIMIT).await {
-            Ok(reply) => reply,
-            Err(ProbeError::NotControl) => {
-                return Err(refuse(format!(
-                    "node '{node}' doesn't run the control role; start it with `role = \"control\"` \
-                     or `\"both\"` and `[control] bootstrap = \"join\"`"
-                )));
-            }
-            Err(ProbeError::NoControlGroup) => {
-                let release = node
-                    .parse()
-                    .ok()
-                    .and_then(|id| state.member(&id).map(|member| member.running()))
-                    .map_or_else(
-                        || "a fleetring release".to_owned(),
-                        |software| format!("fleetring {}", software.release()),
-                    );
-                return Err(refuse(format!(
-                    "node '{node}' runs {release}, which has no control group"
-                )));
-            }
-            Err(ProbeError::Refused(why)) => {
-                return Err(refuse(format!(
-                    "it belongs to a control group this node isn't a member of ({why})"
-                )));
-            }
-            Err(error) => return Err(refuse(error.to_string())),
-        };
+        let reply = self.probe(node, address, &state).await.map_err(refuse)?;
         probe_verdict(node, &reply, &state, &self.gate).map_err(refuse)?;
-        // The probe's reply names the node as the node says; its certificate names it as the
-        // fleet's authority does. Plaintext names nobody, and passes.
-        match self.network.certified(address, PROBE_LIMIT).await {
-            Ok(None) => {}
-            Ok(Some(Peer::Node(id))) if id.as_str() == node => {}
-            Ok(Some(Peer::Node(id))) => {
-                return Err(refuse(format!(
-                    "the node at that address presents the certificate of node '{id}'"
-                )));
-            }
-            Ok(Some(Peer::Principal(name))) => {
-                return Err(refuse(format!(
-                    "the server at that address presents the certificate of principal '{name}'"
-                )));
-            }
-            Ok(Some(Peer::Plaintext)) => {}
-            Err(error) => return Err(refuse(error.to_string())),
-        }
+        self.check_certificate(node, address)
+            .await
+            .map_err(refuse)?;
         let peer = ControlPeer::new(node, address);
         // The gate counts the node from now on, before openraft's membership names it, so no first
         // use slips in while it is being added.
@@ -956,6 +924,51 @@ impl ControlHandle {
                 Ok(())
             }
             Ok(Err(error)) => Err(group_error(error)),
+        }
+    }
+
+    /// Probes the node `node` at `address`, and says why it can't be reached or read if so.
+    async fn probe(&self, node: &str, address: &str, state: &State) -> Result<ProbeReply, String> {
+        match self.network.probe(address, PROBE_LIMIT).await {
+            Ok(reply) => Ok(reply),
+            Err(ProbeError::NotControl) => Err(format!(
+                "node '{node}' doesn't run the control role; start it with `role = \"control\"` \
+                 or `\"both\"` and `[control] bootstrap = \"join\"`"
+            )),
+            Err(ProbeError::NoControlGroup) => {
+                let release = node
+                    .parse()
+                    .ok()
+                    .and_then(|id| state.member(&id).map(|member| member.running()))
+                    .map_or_else(
+                        || "a fleetring release".to_owned(),
+                        |software| format!("fleetring {}", software.release()),
+                    );
+                Err(format!(
+                    "node '{node}' runs {release}, which has no control group"
+                ))
+            }
+            Err(ProbeError::Refused(why)) => Err(format!(
+                "it belongs to a control group this node isn't a member of ({why})"
+            )),
+            Err(error) => Err(error.to_string()),
+        }
+    }
+
+    /// Checks that the server at `address` presents the certificate of node `node`. The probe's
+    /// reply names the node as the node says; its certificate names it as the fleet's authority
+    /// does. Plaintext names nobody, and passes.
+    async fn check_certificate(&self, node: &str, address: &str) -> Result<(), String> {
+        match self.network.certified(address, PROBE_LIMIT).await {
+            Ok(None | Some(Peer::Plaintext)) => Ok(()),
+            Ok(Some(Peer::Node(id))) if id.as_str() == node => Ok(()),
+            Ok(Some(Peer::Node(id))) => Err(format!(
+                "the node at that address presents the certificate of node '{id}'"
+            )),
+            Ok(Some(Peer::Principal(name))) => Err(format!(
+                "the server at that address presents the certificate of principal '{name}'"
+            )),
+            Err(error) => Err(error.to_string()),
         }
     }
 
