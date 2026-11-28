@@ -21,18 +21,19 @@ use fleetring_control::{
 };
 use fleetring_proto::v1::control_server::Control;
 use fleetring_proto::v1::{
-    self as proto, AcquireLeaseRequest, ChangeDurabilityRequest, ChangeDurabilityResponse,
-    CompletePromotionRequest, CompletePromotionResponse, CreateDatabaseRequest,
-    CreateDatabaseResponse, CreateDatabaseWithMetadataRequest, DelegateTokenRequest,
-    DelegateTokenResponse, DrainRequest, DrainResponse, DropDatabaseRequest, DropDatabaseResponse,
-    ForkDatabaseRequest, ForkOperationStatus, GetForkOperationRequest, HeartbeatRequest,
-    HeartbeatResponse, JoinRequest, JoinResponse, LeaseResponse, LeaveRequest, LeaveResponse,
-    ListDatabasesRequest, ListDatabasesResponse, ListDelegationsRequest, ListDelegationsResponse,
-    ListTombstonesRequest, ListTombstonesResponse, LocateRequest, LocateResponse, MembershipUpdate,
-    Placement, PromotionResponse, RecordFencedRequest, RecordFencedResponse, RenewLeaseRequest,
-    RevokeTokenRequest, RevokeTokenResponse, StartPromotionRequest, TransferLeaseRequest,
-    UndrainRequest, UndrainResponse, UpdateDatabaseRequest, UpdateDatabaseResponse,
-    WatchMembershipRequest,
+    self as proto, AcquireLeaseRequest, AddControlNodeRequest, ChangeDurabilityRequest,
+    ChangeDurabilityResponse, CompletePromotionRequest, CompletePromotionResponse,
+    CreateDatabaseRequest, CreateDatabaseResponse, CreateDatabaseWithMetadataRequest,
+    DelegateTokenRequest, DelegateTokenResponse, DescribeControlGroupRequest, DrainRequest,
+    DrainResponse, DropDatabaseRequest, DropDatabaseResponse, ForkDatabaseRequest,
+    ForkOperationStatus, GetForkOperationRequest, HeartbeatRequest, HeartbeatResponse, JoinRequest,
+    JoinResponse, LeaseResponse, LeaveRequest, LeaveResponse, ListDatabasesRequest,
+    ListDatabasesResponse, ListDelegationsRequest, ListDelegationsResponse, ListTombstonesRequest,
+    ListTombstonesResponse, LocateRequest, LocateResponse, MembershipUpdate, Placement,
+    PromotionResponse, RecordFencedRequest, RecordFencedResponse, RemoveControlNodeRequest,
+    RenewLeaseRequest, RevokeTokenRequest, RevokeTokenResponse, SetControlVotersRequest,
+    StartPromotionRequest, TransferLeaseRequest, UndrainRequest, UndrainResponse,
+    UpdateDatabaseRequest, UpdateDatabaseResponse, WatchMembershipRequest,
 };
 use fleetring_proto::{PROTOCOL_VERSION, check_protocol};
 use tokio_stream::wrappers::WatchStream;
@@ -64,6 +65,7 @@ use crate::router::{Entropy, SystemEntropy};
 use crate::software::{software_from_proto, software_to_proto};
 use crate::tls::{IssuerCertError, IssuerPair, Peer};
 
+mod group;
 mod revoke;
 
 /// The stream `WatchMembership` returns.
@@ -2384,6 +2386,40 @@ impl Control for ControlService {
             .map(|(id, record)| delegation_record(id, record))
             .collect();
         Ok(Response::new(ListDelegationsResponse { delegations }))
+    }
+
+    async fn add_control_node(
+        &self,
+        request: Request<AddControlNodeRequest>,
+    ) -> Result<Response<proto::ControlGroup>, Status> {
+        let caller = revoke::who(&request);
+        let change = self.clone().add_member(caller, request.into_inner());
+        group::run_to_end(change).await.map(Response::new)
+    }
+
+    async fn set_control_voters(
+        &self,
+        request: Request<SetControlVotersRequest>,
+    ) -> Result<Response<proto::ControlGroup>, Status> {
+        let caller = revoke::who(&request);
+        let change = self.clone().change_voters(caller, request.into_inner());
+        group::run_to_end(change).await.map(Response::new)
+    }
+
+    async fn remove_control_node(
+        &self,
+        request: Request<RemoveControlNodeRequest>,
+    ) -> Result<Response<proto::ControlGroup>, Status> {
+        let caller = revoke::who(&request);
+        let change = self.clone().remove_member(caller, request.into_inner());
+        group::run_to_end(change).await.map(Response::new)
+    }
+
+    async fn describe_control_group(
+        &self,
+        _: Request<DescribeControlGroupRequest>,
+    ) -> Result<Response<proto::ControlGroup>, Status> {
+        self.describe().await.map(Response::new)
     }
 }
 

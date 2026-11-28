@@ -13,7 +13,7 @@ use tokio_rustls::{TlsAcceptor, TlsConnector, TlsStream};
 use tonic::transport::server::Connected;
 
 use crate::tls::names::{FleetName, SubjectUri};
-use crate::tls::{Peer, Security};
+use crate::tls::{Identity, Peer, Security};
 
 /// How long a handshake may take before the connection is dropped. It bounds what a peer that
 /// connects and goes silent can hold.
@@ -207,6 +207,40 @@ impl Security {
             }
         }
     }
+
+    /// Connects `raw` to the server at `address` as [`Security::connect`] does, and returns
+    /// the node or principal the server's verified certificate names, then drops the
+    /// connection; `None` in plaintext, where nothing names the server.
+    ///
+    /// # Errors
+    ///
+    /// An I/O error if the handshake fails, or the server's certificate names nothing this
+    /// fleet accepts.
+    pub(crate) async fn server_peer(&self, address: &str, raw: Raw) -> io::Result<Option<Peer>> {
+        match self {
+            Self::Plaintext => Ok(None),
+            Self::Tls(identity) => server_peer_over(identity, address, raw).await.map(Some),
+        }
+    }
+}
+
+/// The node or principal the verified certificate of the server at `address`, on `io`, names,
+/// after a handshake as `identity`.
+///
+/// # Errors
+///
+/// An I/O error if the handshake fails, or the server's certificate names nothing this fleet
+/// accepts.
+async fn server_peer_over<S>(identity: &Identity, address: &str, io: S) -> io::Result<Peer>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let loaded = identity.current();
+    let connector = TlsConnector::from(loaded.client_config());
+    let name = server_name(address)?;
+    let stream = connector.connect(name, io).await?;
+    let certificates = stream.get_ref().1.peer_certificates().unwrap_or_default();
+    peer_of(certificates, loaded.fleet()).map_err(io::Error::other)
 }
 
 /// Why [`peer_of`] refuses an issuer certificate, on every listener (ADR-0047, point 1.5).
@@ -282,6 +316,62 @@ mod tests {
         let name = server_name("node-1:7400").expect("dns");
         assert!(matches!(name, rustls_pki_types::ServerName::DnsName(_)));
         assert!(server_name("bad host:7400").is_err());
+    }
+
+    /// The certificate check a leader makes before it adds a node (ADR-0040 point 4): a server's
+    /// node certificate names its node, and a client certificate, which can't serve, is refused.
+    #[tokio::test]
+    async fn a_server_is_named_by_its_certificate() {
+        use fleetring_control::Timestamp;
+
+        use crate::tls::{Authority, Validity};
+
+        let validity = Validity::new(
+            Timestamp::ZERO,
+            Duration::from_secs(100 * 365 * 24 * 60 * 60),
+        );
+        let authority =
+            Authority::create("lab".parse().expect("fleet name"), validity).expect("authority");
+        let identity = |issued| {
+            Identity::from_issued(authority.certificate_pem(), &issued).expect("an identity")
+        };
+        let localhost = ["localhost".to_owned()];
+        let leader = identity(
+            authority
+                .issue_node(&"c1".parse().expect("node id"), &localhost, validity)
+                .expect("node"),
+        );
+        let serve = |server: Identity| {
+            let (client, served) = tokio::io::duplex(64 * 1024);
+            tokio::spawn(async move {
+                let acceptor = TlsAcceptor::from(server.current().server_config());
+                // The handshake's outcome is the client's to judge.
+                let _accepted = acceptor.accept(served).await;
+            });
+            client
+        };
+        let node = identity(
+            authority
+                .issue_node(&"c2".parse().expect("node id"), &localhost, validity)
+                .expect("node"),
+        );
+        let named = server_peer_over(&leader, "localhost:7400", serve(node))
+            .await
+            .expect("a node certificate names its node");
+        assert!(
+            matches!(&named, Peer::Node(id) if id.as_str() == "c2"),
+            "{named:?}"
+        );
+        let client = identity(
+            authority
+                .issue_client(&"alice".parse().expect("principal"), validity)
+                .expect("client"),
+        );
+        let refused = server_peer_over(&leader, "localhost:7400", serve(client)).await;
+        assert!(
+            !matches!(refused, Ok(Peer::Node(_))),
+            "a client certificate doesn't pass as a node: {refused:?}"
+        );
     }
 
     #[test]

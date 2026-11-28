@@ -37,6 +37,7 @@ use crate::control::raft::state_machine::{ControlSnapshotOf, SnapshotData};
 use crate::control::raft::{ControlPeer, ControlTypes, RaftId, Vote, raft_id_text};
 use crate::environment::Network;
 use crate::software::{software_from_proto, software_to_proto};
+use crate::tls::Peer;
 use crate::transport::raft_client;
 
 /// How long one `InstallSnapshot` chunk, 1 MiB of snapshot, may take to send and answer: openraft's
@@ -148,6 +149,28 @@ impl ControlNetwork {
             Ok(Ok(reply)) => reply.into_inner(),
         };
         serde_json::from_slice(&reply.json).map_err(|error| ProbeError::Invalid(error.to_string()))
+    }
+
+    /// The node or principal the certificate of the server at `address` names, waiting at most
+    /// `limit`; `None` in plaintext, where nothing names it. A probe's reply names the node only
+    /// as the node says, so the leader checks the certificate as well.
+    ///
+    /// # Errors
+    ///
+    /// [`ProbeError::Unreachable`] if the server can't be reached or its handshake fails.
+    pub(crate) async fn certified(
+        &self,
+        address: &str,
+        limit: Duration,
+    ) -> Result<Option<Peer>, ProbeError> {
+        match tokio::time::timeout(limit, self.network.server_peer(address)).await {
+            Err(_elapsed) => Err(ProbeError::Unreachable(format!(
+                "no handshake within {} ms",
+                limit.as_millis()
+            ))),
+            Ok(Err(error)) => Err(ProbeError::Unreachable(error.to_string())),
+            Ok(Ok(peer)) => Ok(peer),
+        }
     }
 }
 

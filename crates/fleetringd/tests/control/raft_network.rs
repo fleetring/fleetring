@@ -41,7 +41,7 @@ fn member(id: &str) -> Member {
 
 /// The configuration of control node `id` under `root`, with `bootstrap` and short Raft timings,
 /// and `control` appended to its `[control]` table.
-fn config(
+pub(crate) fn config(
     root: &Path,
     tls: &str,
     id: &str,
@@ -58,7 +58,7 @@ fn config(
 }
 
 /// Starts control node `id`, reporting `software` to its group.
-async fn start(
+pub(crate) async fn start(
     root: &Path,
     tls: &Tls,
     id: &str,
@@ -80,16 +80,16 @@ async fn start(
     Ok(Daemon::start_with(config(root, &table, id, bootstrap, control)?, environment).await?)
 }
 
-fn handle(daemon: &Daemon) -> ControlHandle {
+pub(crate) fn handle(daemon: &Daemon) -> ControlHandle {
     daemon.control().expect("a control node")
 }
 
-fn address(daemon: &Daemon) -> String {
+pub(crate) fn address(daemon: &Daemon) -> String {
     daemon.listen_address().to_string()
 }
 
 /// Waits until `check` holds, polling, for at most [`SETTLE`].
-async fn until(what: &str, mut check: impl FnMut() -> bool) -> TestResult {
+pub(crate) async fn until(what: &str, mut check: impl FnMut() -> bool) -> TestResult {
     let deadline = tokio::time::Instant::now() + SETTLE;
     while !check() {
         if tokio::time::Instant::now() > deadline {
@@ -101,7 +101,7 @@ async fn until(what: &str, mut check: impl FnMut() -> bool) -> TestResult {
 }
 
 /// Adds every node of `joiners` to `leader`'s group as a learner.
-async fn add(leader: &Daemon, joiners: &[(&str, &Daemon)]) -> TestResult {
+pub(crate) async fn add(leader: &Daemon, joiners: &[(&str, &Daemon)]) -> TestResult {
     for (id, daemon) in joiners {
         handle(leader).add_node(id, &address(daemon)).await?;
     }
@@ -109,13 +109,13 @@ async fn add(leader: &Daemon, joiners: &[(&str, &Daemon)]) -> TestResult {
 }
 
 /// The ID of the leader `daemon` knows, if any.
-fn leader_of(daemon: &Daemon) -> Option<String> {
+pub(crate) fn leader_of(daemon: &Daemon) -> Option<String> {
     handle(daemon).leader().map(|peer| peer.node_id)
 }
 
 /// Starts `c1` with `bootstrap = "new"` and `c2` and `c3` with `"join"`, `c3` reporting
 /// `c3_software`, adds both, and makes all three voters.
-async fn three(
+pub(crate) async fn three(
     root: &Path,
     tls: &Tls,
     c3_software: Option<Software>,
@@ -134,7 +134,7 @@ async fn three(
     Ok([c1, c2, c3])
 }
 
-async fn stop(daemons: impl IntoIterator<Item = Daemon>) {
+pub(crate) async fn stop(daemons: impl IntoIterator<Item = Daemon>) {
     for daemon in daemons {
         daemon.run_until(async {}).await;
     }
@@ -241,7 +241,11 @@ impl fleetring_proto::v1::raft_server::Raft for Release09 {
 }
 
 /// A plaintext control node, `insecure_plaintext`, for tests whose stubs serve no TLS.
-async fn start_plaintext(root: &Path, id: &str, bootstrap: &str) -> Result<Daemon, Box<dyn Error>> {
+pub(crate) async fn start_plaintext(
+    root: &Path,
+    id: &str,
+    bootstrap: &str,
+) -> Result<Daemon, Box<dyn Error>> {
     let config = Config::from_toml(&format!(
         "data_dir = {:?}\nlisten = \"127.0.0.1:0\"\ninsecure_plaintext = true\nrole = \"control\"\n\n\
          [node]\nid = {id:?}\n\n[control]\nbootstrap = {bootstrap:?}\n\n[admin]\nlisten = \"127.0.0.1:0\"\n",

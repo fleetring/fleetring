@@ -22,7 +22,7 @@ use crate::durability::ObjectStore;
 use crate::engine::Execution;
 use crate::replication::ForkFaults;
 use crate::router::{Entropy, SystemEntropy};
-use crate::tls::{Conn, Raw, Security};
+use crate::tls::{Conn, Peer, Raw, Security};
 use crate::transport::{Credentials, TransportConfig};
 
 /// How a daemon reaches its peers: real TCP, or turmoil's simulated network.
@@ -211,6 +211,18 @@ impl Network {
             }
         });
         Ok(endpoint.connect_with_connector_lazy(connector))
+    }
+
+    /// Dials the server at `address` and returns the node or principal its certificate names;
+    /// `None` in plaintext, where nothing names it.
+    ///
+    /// # Errors
+    ///
+    /// An I/O error if the server can't be reached, the handshake fails, or its certificate
+    /// names nothing this fleet accepts.
+    pub(crate) async fn server_peer(&self, address: &str) -> io::Result<Option<Peer>> {
+        let raw = self.link.connect(address).await?;
+        self.security.server_peer(address, raw).await
     }
 
     /// A control client that starts at `address` and dials every leader over this network.

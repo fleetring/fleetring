@@ -80,9 +80,9 @@ mod watch;
 pub(crate) use client::unknown_call;
 pub use client::{
     ArchiveDescription, ArchiveVerification, ArchivedSnapshot, ChangeUpdate, ChangeUpdates,
-    ChangedTransaction, Client, DatabaseSpec, DurabilityChange, ForkSpec, LeaseUpdate,
-    LeaseUpdates, Location, NodeStatus, Orphan, ReplicaInfo, Restoration, RestoredExpiry,
-    ServedDatabase, StagedOrphan, Verification, WITHOUT_WATCH, Written,
+    ChangedTransaction, Client, ControlGroupView, ControlMember, DatabaseSpec, DurabilityChange,
+    ForkSpec, LeaseUpdate, LeaseUpdates, Location, NodeStatus, Orphan, ReplicaInfo, Restoration,
+    RestoredExpiry, ServedDatabase, StagedOrphan, Verification, WITHOUT_WATCH, Written,
 };
 pub(crate) use drain::DrainSettings;
 pub(crate) use fork::ForkKeeper;

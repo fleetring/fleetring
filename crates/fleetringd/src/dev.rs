@@ -134,6 +134,23 @@ impl From<bool> for DevMode {
     }
 }
 
+/// Checks that `address` is on loopback, as every address a dev mode node serves or dials must
+/// be (ADR-0039 point 3): its configuration's, and a control node it adds to its group
+/// (ADR-0040 point 9).
+///
+/// # Errors
+///
+/// Why it isn't, naming the address.
+pub(crate) fn check_loopback(address: SocketAddr) -> Result<(), String> {
+    if address.ip().is_loopback() {
+        Ok(())
+    } else {
+        Err(format!(
+            "{address} isn't a loopback address, and dev mode serves loopback only (ADR-0039)"
+        ))
+    }
+}
+
 /// Checks the rules dev mode adds: every address loopback, both roles, and TLS.
 ///
 /// # Errors
@@ -144,17 +161,7 @@ pub(crate) fn validate(config: &Config) -> Result<(), ConfigError> {
         return Ok(());
     }
     let loopback = |field: &'static str, address: SocketAddr| {
-        if address.ip().is_loopback() {
-            Ok(())
-        } else {
-            Err(ConfigError::Invalid {
-                field,
-                reason: format!(
-                    "{address} isn't a loopback address, and dev mode serves loopback only \
-                     (ADR-0039)"
-                ),
-            })
-        }
+        check_loopback(address).map_err(|reason| ConfigError::Invalid { field, reason })
     };
     loopback("listen", config.listen)?;
     if let Some(advertise) = config.node.advertise {

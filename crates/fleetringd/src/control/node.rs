@@ -45,6 +45,7 @@ use crate::control::store::ControlStore;
 use crate::environment::Network;
 use crate::observe::{ControlMetrics, RaftSample};
 use crate::router::Entropy;
+use crate::tls::Peer;
 
 /// How many log entries the control group takes between control snapshots, by default.
 const DEFAULT_SNAPSHOT_EVERY: NonZeroU64 = NonZeroU64::new(1_000).expect("1000 is nonzero");
@@ -434,6 +435,23 @@ pub struct GroupMember {
     pub software: Option<Software>,
 }
 
+/// The control group as one control node knows it, from one reading of its Raft metrics.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct GroupStatus {
+    /// Every voter and learner, in Raft ID order.
+    pub members: Vec<GroupMember>,
+    /// The leader's node ID, if this node knows one.
+    pub leader: Option<String>,
+    /// The control group's Raft term.
+    pub term: u64,
+    /// The index of the last entry this node knows the group has committed.
+    pub committed_index: u64,
+    /// Whether a change of voters began and hasn't finished, so that every change needs both
+    /// configurations' quorums until another `set_voters` finishes it.
+    pub joint: bool,
+}
+
 /// The error returned when the control group's membership can't be changed.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
@@ -491,6 +509,10 @@ const PROBE_LIMIT: Duration = Duration::from_secs(10);
 
 /// How many entries a new voter may lag the leader's log by when it is made a voter.
 const CAUGHT_UP_ENTRIES: u64 = 64;
+
+/// The most voters a control group may have (ADR-0035 point 11): three or five is the advice, and
+/// every voter more adds a replication round's worth of load to each commit.
+pub const MAX_VOTERS: usize = 7;
 
 /// How many shortest election timeouts a proposal batch may wait for openraft's answer before the
 /// proposer refuses what queues behind it: long enough that a slow disk under load doesn't trip it,
@@ -691,6 +713,64 @@ impl ControlHandle {
             .collect()
     }
 
+    /// Returns the control group as this node knows it, from one reading of its Raft metrics:
+    /// every voter and learner, in Raft ID order, the leader, the term, the committed index, and
+    /// whether the membership is joint.
+    #[must_use]
+    pub fn group_status(&self) -> GroupStatus {
+        let Some(raft) = &self.raft else {
+            return GroupStatus::default();
+        };
+        let metrics = raft.metrics();
+        let metrics = metrics.borrow_watched();
+        let membership = metrics.membership_config.membership();
+        let voters: BTreeSet<RaftId> = membership.voter_ids().collect();
+        let members = membership
+            .nodes()
+            .map(|(id, peer)| GroupMember {
+                peer: peer.clone(),
+                voter: voters.contains(id),
+                leader: metrics.current_leader == Some(*id),
+                matched_index: metrics
+                    .replication
+                    .as_ref()
+                    .and_then(|replication| replication.get(id))
+                    .and_then(|matched| matched.as_ref())
+                    .map_or(0, |log_id| log_id.index),
+                software: self.gate.group().last_heard(*id),
+            })
+            .collect();
+        GroupStatus {
+            members,
+            leader: metrics
+                .current_leader
+                .and_then(|leader| membership.get_node(&leader))
+                .map(|peer| peer.node_id.clone()),
+            term: metrics.current_term,
+            committed_index: metrics.local_committed.map_or(0, |log_id| log_id.index),
+            joint: membership.get_joint_config().len() > 1,
+        }
+    }
+
+    /// Returns the control group's Raft term, as this node knows it.
+    #[must_use]
+    pub fn term(&self) -> u64 {
+        self.raft
+            .as_ref()
+            .map_or(0, |raft| raft.metrics().borrow_watched().current_term)
+    }
+
+    /// Returns the index of the last entry this node knows the control group has committed.
+    #[must_use]
+    pub fn committed_index(&self) -> u64 {
+        self.raft.as_ref().map_or(0, |raft| {
+            raft.metrics()
+                .borrow_watched()
+                .local_committed
+                .map_or(0, |log_id| log_id.index)
+        })
+    }
+
     /// Every voter's and learner's peer, as this node's membership names them; none on a node
     /// that belongs to no group yet.
     pub(crate) fn group_peers(&self) -> Vec<ControlPeer> {
@@ -755,16 +835,17 @@ impl ControlHandle {
             Readiness::Follower { leader } => Err(GroupError::NotLeader {
                 leader: leader.map(|peer| peer.address),
             }),
-            Readiness::CatchingUp { .. } => Err(GroupError::NotLeader {
-                leader: Some(self.own.address.clone()),
-            }),
+            // A leader still catching up names no leader: naming itself would send the caller
+            // straight back.
+            Readiness::CatchingUp { .. } => Err(GroupError::NotLeader { leader: None }),
         }
     }
 
     /// Adds the node `node`, which serves at `address`, to the control group as a learner, and
     /// waits for it to catch up with the leader's log.
     ///
-    /// The node is probed first, and refused when its node ID isn't `node`, its store holds Raft
+    /// The node is probed first, and refused when its node ID, or the node its certificate
+    /// names, isn't `node`, its store holds Raft
     /// state, its release can't run beside a fleet member's or a group member's, it lacks a fleet
     /// feature the fleet has enabled, its control state starts from another genesis
     /// configuration than the group's, or it has no `Raft` service (ADR-0040 point 4).
@@ -822,6 +903,24 @@ impl ControlHandle {
             Err(error) => return Err(refuse(error.to_string())),
         };
         probe_verdict(node, &reply, &state, &self.gate).map_err(refuse)?;
+        // The probe's reply names the node as the node says; its certificate names it as the
+        // fleet's authority does. Plaintext names nobody, and passes.
+        match self.network.certified(address, PROBE_LIMIT).await {
+            Ok(None) => {}
+            Ok(Some(Peer::Node(id))) if id.as_str() == node => {}
+            Ok(Some(Peer::Node(id))) => {
+                return Err(refuse(format!(
+                    "the node at that address presents the certificate of node '{id}'"
+                )));
+            }
+            Ok(Some(Peer::Principal(name))) => {
+                return Err(refuse(format!(
+                    "the server at that address presents the certificate of principal '{name}'"
+                )));
+            }
+            Ok(Some(Peer::Plaintext)) => {}
+            Err(error) => return Err(refuse(error.to_string())),
+        }
         let peer = ControlPeer::new(node, address);
         // The gate counts the node from now on, before openraft's membership names it, so no first
         // use slips in while it is being added.
@@ -844,7 +943,8 @@ impl ControlHandle {
     }
 
     /// Makes `voters` the control group's voters, each of them a member already; a voter left
-    /// out stays a learner. The count must be odd, and each new voter must hold the leader's log
+    /// out stays a learner. The count must be odd and at most [`MAX_VOTERS`], and each new voter
+    /// must hold the leader's log
     /// to within a few entries and have reported its software this term.
     ///
     /// # Errors
@@ -872,6 +972,14 @@ impl ControlHandle {
             return Err(GroupError::Invalid {
                 reason: format!(
                     "a control group needs an odd number of voters, not {}",
+                    ids.len()
+                ),
+            });
+        }
+        if ids.len() > MAX_VOTERS {
+            return Err(GroupError::Invalid {
+                reason: format!(
+                    "a control group has at most {MAX_VOTERS} voters, not {}",
                     ids.len()
                 ),
             });

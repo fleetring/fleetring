@@ -126,6 +126,7 @@ const _: () = {
     assert_debug_send_sync::<control::ControlGroup>();
     assert_debug_send_sync::<control::GroupError>();
     assert_debug_send_sync::<control::GroupMember>();
+    assert_debug_send_sync::<control::GroupStatus>();
     assert_debug_send_sync::<control::ControlHandle>();
     assert_debug_send_sync::<control::ControlNode>();
     assert_debug_send_sync::<control::ControlOptions>();
@@ -164,6 +165,8 @@ const _: () = {
     assert_debug_send_sync::<data::ArchiveDescription>();
     assert_debug_send_sync::<data::ArchiveVerification>();
     assert_debug_send_sync::<data::ArchivedSnapshot>();
+    assert_debug_send_sync::<data::ControlGroupView>();
+    assert_debug_send_sync::<data::ControlMember>();
     assert_debug_send_sync::<data::Client>();
     assert_debug_send_sync::<data::Restoration>();
     assert_debug_send_sync::<data::RestoredExpiry>();

@@ -8,17 +8,18 @@ use std::sync::{Arc, Mutex};
 use fleetring_client::redirect::leader_hint;
 use fleetring_proto::v1::control_client::ControlClient as GrpcControlClient;
 use fleetring_proto::v1::{
-    AcquireLeaseRequest, ChangeDurabilityRequest, ChangeDurabilityResponse,
-    CompletePromotionRequest, CompletePromotionResponse, ControlNode, CreateDatabaseRequest,
-    CreateDatabaseResponse, CreateDatabaseWithMetadataRequest, DelegateTokenRequest,
-    DelegateTokenResponse, DrainRequest, DrainResponse, DropDatabaseRequest, DropDatabaseResponse,
-    ForkDatabaseRequest, ForkOperationStatus, GetForkOperationRequest, HeartbeatRequest,
-    HeartbeatResponse, JoinRequest, JoinResponse, LeaseResponse, LeaveRequest, LeaveResponse,
-    ListDatabasesRequest, ListDatabasesResponse, ListDelegationsRequest, ListDelegationsResponse,
-    LocateRequest, LocateResponse, MembershipUpdate, PromotionResponse, RecordFencedRequest,
-    RecordFencedResponse, RenewLeaseRequest, RevokeTokenRequest, RevokeTokenResponse,
-    StartPromotionRequest, TransferLeaseRequest, UndrainRequest, UndrainResponse,
-    UpdateDatabaseRequest, UpdateDatabaseResponse, WatchMembershipRequest,
+    AcquireLeaseRequest, AddControlNodeRequest, ChangeDurabilityRequest, ChangeDurabilityResponse,
+    CompletePromotionRequest, CompletePromotionResponse, ControlGroup, ControlNode,
+    CreateDatabaseRequest, CreateDatabaseResponse, CreateDatabaseWithMetadataRequest,
+    DelegateTokenRequest, DelegateTokenResponse, DescribeControlGroupRequest, DrainRequest,
+    DrainResponse, DropDatabaseRequest, DropDatabaseResponse, ForkDatabaseRequest,
+    ForkOperationStatus, GetForkOperationRequest, HeartbeatRequest, HeartbeatResponse, JoinRequest,
+    JoinResponse, LeaseResponse, LeaveRequest, LeaveResponse, ListDatabasesRequest,
+    ListDatabasesResponse, ListDelegationsRequest, ListDelegationsResponse, LocateRequest,
+    LocateResponse, MembershipUpdate, PromotionResponse, RecordFencedRequest, RecordFencedResponse,
+    RemoveControlNodeRequest, RenewLeaseRequest, RevokeTokenRequest, RevokeTokenResponse,
+    SetControlVotersRequest, StartPromotionRequest, TransferLeaseRequest, UndrainRequest,
+    UndrainResponse, UpdateDatabaseRequest, UpdateDatabaseResponse, WatchMembershipRequest,
 };
 use tonic::transport::{Channel, Endpoint};
 use tonic::{Code, Response, Status, Streaming};
@@ -44,8 +45,9 @@ type Connect = dyn Fn(&str) -> Result<Channel, tonic::transport::Error> + Send +
 ///   `UNAVAILABLE` or a lost reply alone, under the same operation ID, so a resend returns the delegation the
 ///   first attempt recorded. `create_database`, `create_database_with_metadata`,
 ///   `update_database`, `drop_database`, `acquire_lease`, `leave`, `start_promotion`,
-///   `complete_promotion`, and `transfer_lease` are sent once per leader, because a lost reply
-///   would make a retry fail as already done, or apply a patch twice.
+///   `complete_promotion`, `transfer_lease`, and the control group's changes
+///   (`add_control_node`, `set_control_voters`, `remove_control_node`) are sent once per leader,
+///   because a lost reply would make a retry fail as already done, or apply a patch twice.
 ///
 /// Cloning is cheap; clones share the current leader and connections.
 #[derive(Clone)]
@@ -688,6 +690,74 @@ impl ControlClient {
         self.retrying(|mut client| {
             let request = request.clone();
             async move { client.list_delegations(request).await }
+        })
+        .await
+    }
+
+    /// Adds a node to the control group as a learner, and returns the group once it has caught
+    /// up (ADR-0035 point 11). Sent once per leader, not retried: a resend after a lost reply
+    /// would be refused as a member already.
+    ///
+    /// # Errors
+    ///
+    /// The status the leader returned, or `UNAVAILABLE` if it couldn't be reached. A control node
+    /// that predates the call refuses it.
+    pub async fn add_control_node(
+        &self,
+        request: AddControlNodeRequest,
+    ) -> Result<ControlGroup, Status> {
+        self.following(&|mut client: GrpcControlClient<CredentialedChannel>| {
+            let request = request.clone();
+            async move { client.add_control_node(request).await }
+        })
+        .await
+    }
+
+    /// Makes exactly the named nodes the control group's voters, and returns the group after.
+    /// Sent once per leader, not retried: a lost reply leaves the outcome to read with
+    /// [`describe_control_group`](Self::describe_control_group).
+    ///
+    /// # Errors
+    ///
+    /// The status the leader returned, or `UNAVAILABLE` if it couldn't be reached.
+    pub async fn set_control_voters(
+        &self,
+        request: SetControlVotersRequest,
+    ) -> Result<ControlGroup, Status> {
+        self.following(&|mut client: GrpcControlClient<CredentialedChannel>| {
+            let request = request.clone();
+            async move { client.set_control_voters(request).await }
+        })
+        .await
+    }
+
+    /// Removes a learner from the control group, and returns the group after. Sent once per
+    /// leader, not retried: a resend after a lost reply would be refused as no member.
+    ///
+    /// # Errors
+    ///
+    /// The status the leader returned, or `UNAVAILABLE` if it couldn't be reached.
+    pub async fn remove_control_node(
+        &self,
+        request: RemoveControlNodeRequest,
+    ) -> Result<ControlGroup, Status> {
+        self.following(&|mut client: GrpcControlClient<CredentialedChannel>| {
+            let request = request.clone();
+            async move { client.remove_control_node(request).await }
+        })
+        .await
+    }
+
+    /// Reads the control group: its members, term, and committed index. Retried.
+    ///
+    /// # Errors
+    ///
+    /// The status of the last attempt.
+    pub async fn describe_control_group(&self) -> Result<ControlGroup, Status> {
+        self.retrying(|mut client| async move {
+            client
+                .describe_control_group(DescribeControlGroupRequest {})
+                .await
         })
         .await
     }

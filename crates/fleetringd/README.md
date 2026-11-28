@@ -468,6 +468,10 @@ A token is checked when a request arrives, and a stream opened with one (`WatchL
 | `Control.GetForkOperation` | the requesting principal, or admin on the target | — |
 | `Control.DelegateToken` | an agent's token whose grant covers the child (checked in the handler) | — |
 | `Control.ListDelegations` | fleet | — |
+| `Control.AddControlNode` | fleet | — |
+| `Control.SetControlVoters` | fleet | — |
+| `Control.RemoveControlNode` | fleet | — |
+| `Control.DescribeControlGroup` | fleet | — |
 | `Replication.Replicate` | node | holder or candidate |
 | `Replication.Fence` | node | candidate |
 | `Replication.Snapshot` | node | follower or seeding |
