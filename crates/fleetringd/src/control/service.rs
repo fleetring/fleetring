@@ -53,6 +53,7 @@ use crate::control::fork::{
 };
 use crate::control::node::{ControlHandle, SubmitError};
 use crate::control::notices::DropNotices;
+use crate::control::raft::Readiness;
 use crate::data::convert::{
     acks_from_proto, acks_to_proto, change_from_proto, description_from_proto, labels_from_proto,
     metadata_to_proto, revocations_to_proto, spec_expiry_from_proto,
@@ -514,6 +515,45 @@ impl ControlService {
 }
 
 impl ControlService {
+    /// Refuses a call on a node that isn't the control group's ready leader (ADR-0040 point 2):
+    /// every `Control` call is answered by the leader, before the request is read. A follower
+    /// redirects to the leader it knows, and answers `UNAVAILABLE` while it knows none; a leader
+    /// that hasn't applied an entry of its term yet answers `UNAVAILABLE`, retry, without naming
+    /// itself, which would send the client straight back.
+    ///
+    /// # Errors
+    ///
+    /// The redirect or `UNAVAILABLE` status.
+    fn lead(&self) -> Result<(), Status> {
+        match self.node.leadership() {
+            Readiness::Ready { .. } => Ok(()),
+            Readiness::Follower { leader } => Err(submit_status(SubmitError::NotLeader {
+                leader: leader.map(|peer| peer.address),
+            })),
+            Readiness::CatchingUp { .. } => {
+                Err(submit_status(SubmitError::CatchingUp { leader: None }))
+            }
+        }
+    }
+
+    /// The state a linearizable read answers from (ADR-0040 point 2): once a quorum confirms this
+    /// node still leads, through `ReadPolicy::ReadIndex` and never a lease read, and its state
+    /// machine has applied every entry committed before the call, the state it published. The
+    /// caller has checked [`ControlService::lead`], and read and authorized the request, first, so
+    /// that a request refused anyway costs no read round.
+    ///
+    /// # Errors
+    ///
+    /// A redirect when this node no longer leads, and `UNAVAILABLE` when no quorum confirms its
+    /// leadership.
+    async fn read(&self) -> Result<Arc<State>, Status> {
+        self.node
+            .ensure_linearizable()
+            .await
+            .map_err(submit_status)?;
+        Ok(self.node.state())
+    }
+
     /// The control group's voters and learners, with the leader marked, as join and heartbeat
     /// replies carry them, so a data node or router can reach the group at any of its addresses
     /// (ADR-0040 point 12).
@@ -530,6 +570,51 @@ impl ControlService {
                 software: member.software.as_ref().map(software_to_proto),
             })
             .collect()
+    }
+
+    /// Refuses a principal's `Leave` of a voter or learner of the control group, which
+    /// `fleetring node remove` sends (ADR-0040 point 9, decision D7): a dead voter it left in
+    /// place would silently count toward every quorum. A node's own `Leave` under its
+    /// certificate, such as a role-`both` voter's `on_shutdown = "leave"`, passes, since it
+    /// changes the fleet and not the group; so does an anonymous one on a plaintext fleet, where
+    /// nothing tells a node's own leave from an operator's. A request that didn't pass the
+    /// request boundary is judged as a principal's. Checked against this leader's group before
+    /// the command is submitted; `apply` doesn't change.
+    ///
+    /// # Errors
+    ///
+    /// `FAILED_PRECONDITION` naming the commands that take the node out of the group first.
+    fn refuse_removing_a_group_member(
+        &self,
+        request: &Request<LeaveRequest>,
+        id: &NodeId,
+    ) -> Result<(), Status> {
+        match authorized(request).map(Authorized::caller) {
+            Ok(Caller::Node(_) | Caller::Anonymous) => return Ok(()),
+            // A request that didn't pass the boundary names nobody, and is judged as an
+            // operator's: the refusal fails closed.
+            Ok(Caller::Principal { .. }) | Err(_) => {}
+        }
+        if !self.node.group().contains(id.as_str()) {
+            return Ok(());
+        }
+        let status = Status::failed_precondition(format!(
+            "node '{id}' is a member of the control group; take it out with `fleetring control \
+             set-voters` and `fleetring control remove` first"
+        ));
+        let (principal, credential) = revoke::who(request);
+        tracing::warn!(
+            target: AUDIT,
+            principal,
+            credential,
+            node = %id,
+            result = "refused",
+            code = ?status.code(),
+            reason = status.message(),
+            rpc = "Leave",
+            "refused to remove a control group member from the fleet",
+        );
+        Err(status)
     }
 
     /// Mints a delegated agent's token for `caller` (ADR-0047, point 5), in the order the plan
@@ -1595,6 +1680,7 @@ impl Control for ControlService {
     type WatchMembershipStream = MembershipStream;
 
     async fn join(&self, request: Request<JoinRequest>) -> Result<Response<JoinResponse>, Status> {
+        self.lead()?;
         let peer = Peer::of(&request);
         let request = request.into_inner();
         check_protocol(request.protocol.as_ref())?;
@@ -1624,6 +1710,7 @@ impl Control for ControlService {
         &self,
         request: Request<HeartbeatRequest>,
     ) -> Result<Response<HeartbeatResponse>, Status> {
+        self.lead()?;
         let peer = Peer::of(&request);
         let request = request.into_inner();
         let id: NodeId = parse("node id", &request.node_id)?;
@@ -1685,6 +1772,7 @@ impl Control for ControlService {
         &self,
         request: Request<ListTombstonesRequest>,
     ) -> Result<Response<ListTombstonesResponse>, Status> {
+        self.lead()?;
         let databases = request.into_inner().databases;
         if databases.len() > MAX_TOMBSTONE_NAMES {
             return Err(Status::invalid_argument(format!(
@@ -1706,7 +1794,14 @@ impl Control for ControlService {
         &self,
         request: Request<WatchMembershipRequest>,
     ) -> Result<Response<Self::WatchMembershipStream>, Status> {
+        // Opened linearizably, and only on the ready leader; the stream ends with a redirect once
+        // this node stops leading under the leader it opened under (ADR-0040 point 2).
+        self.lead()?;
         let caller = authorized(&request)?.clone();
+        self.read().await?;
+        let Readiness::Ready { leader: opened } = self.node.leadership() else {
+            return Err(Status::unavailable("the control leader changed; retry"));
+        };
         let after_epoch = request.into_inner().after_epoch;
         // What the watcher holds: none until the first state is seen.
         let mut held: Option<(u64, Vec<MemberFlags>, Vec<Feature>)> = None;
@@ -1729,6 +1824,31 @@ impl Control for ControlService {
             held = Some((epoch, flags, features));
             update
         });
+        let lost = WatchStream::new(self.node.watch_leadership()).filter_map(move |readiness| {
+            match readiness {
+                Readiness::Ready { leader } if leader == opened => None,
+                Readiness::Ready { .. } => Some(Err(Status::unavailable(
+                    "the control leader changed; open the watch again",
+                ))),
+                Readiness::Follower { leader } => {
+                    Some(Err(submit_status(SubmitError::NotLeader {
+                        leader: leader.map(|peer| peer.address),
+                    })))
+                }
+                Readiness::CatchingUp { .. } => {
+                    Some(Err(submit_status(SubmitError::CatchingUp { leader: None })))
+                }
+            }
+        });
+        // The first error, the redirect, is the stream's last item.
+        let mut ended = false;
+        let updates = updates.merge(lost).map_while(move |item| {
+            if ended {
+                return None;
+            }
+            ended = item.is_err();
+            Some(item)
+        });
         Ok(Response::new(caller.guard(Box::pin(updates))))
     }
 
@@ -1736,6 +1856,7 @@ impl Control for ControlService {
         &self,
         request: Request<CreateDatabaseRequest>,
     ) -> Result<Response<CreateDatabaseResponse>, Status> {
+        self.lead()?;
         let name: DatabaseName = parse("database name", &request.get_ref().database)?;
         require_database(&request, &name)?;
         let (name, replication_factor, engine, durability) = self.creation(request.get_ref())?;
@@ -1771,6 +1892,7 @@ impl Control for ControlService {
         &self,
         request: Request<CreateDatabaseWithMetadataRequest>,
     ) -> Result<Response<CreateDatabaseResponse>, Status> {
+        self.lead()?;
         let database = request
             .get_ref()
             .database
@@ -1814,6 +1936,7 @@ impl Control for ControlService {
         &self,
         request: Request<UpdateDatabaseRequest>,
     ) -> Result<Response<UpdateDatabaseResponse>, Status> {
+        self.lead()?;
         let name: DatabaseName = parse("database name", &request.get_ref().database)?;
         require_database(&request, &name)?;
         let (mut change, expiry) = change_from_proto(request.get_ref())?;
@@ -1848,6 +1971,7 @@ impl Control for ControlService {
         &self,
         request: Request<ForkDatabaseRequest>,
     ) -> Result<Response<ForkOperationStatus>, Status> {
+        self.lead()?;
         let target: DatabaseName = parse("database name", &request.get_ref().database)?;
         require_database(&request, &target)?;
         let source: DatabaseName = parse("source", &request.get_ref().source)?;
@@ -1917,10 +2041,11 @@ impl Control for ControlService {
         &self,
         request: Request<GetForkOperationRequest>,
     ) -> Result<Response<ForkOperationStatus>, Status> {
+        self.lead()?;
         let authorized = authorized(&request)?;
         let requester = creator(&request)?;
         let operation = operation_from_proto(&request.get_ref().operation_id)?;
-        let state = self.node.state();
+        let state = self.read().await?;
         let now = self.clock.now().max(state.now());
         let known = state.fork_operation(&operation, now);
         let visible = match authorized.caller() {
@@ -1951,6 +2076,7 @@ impl Control for ControlService {
         &self,
         request: Request<DropDatabaseRequest>,
     ) -> Result<Response<DropDatabaseResponse>, Status> {
+        self.lead()?;
         let name: DatabaseName = parse("database name", &request.get_ref().database)?;
         require_database(&request, &name)?;
         // The replicas as they were before the drop: the drop takes the database's reports.
@@ -1974,6 +2100,7 @@ impl Control for ControlService {
         &self,
         request: Request<ChangeDurabilityRequest>,
     ) -> Result<Response<ChangeDurabilityResponse>, Status> {
+        self.lead()?;
         let database: DatabaseName = parse("database name", &request.get_ref().database)?;
         require_database(&request, &database)?;
         let request = request.into_inner();
@@ -2024,9 +2151,10 @@ impl Control for ControlService {
         &self,
         request: Request<LocateRequest>,
     ) -> Result<Response<LocateResponse>, Status> {
+        self.lead()?;
         let name: DatabaseName = parse("database name", &request.get_ref().database)?;
         require_database(&request, &name)?;
-        let state = self.node.state();
+        let state = self.read().await?;
         let mut placement = placement(&state, &name, Descriptions::Include, &self.progress)?;
         if self.fork_faults.hides_replica_sets() {
             // As a control node from before replica sets were shown (0.7) answers.
@@ -2045,6 +2173,7 @@ impl Control for ControlService {
         &self,
         request: Request<ListDatabasesRequest>,
     ) -> Result<Response<ListDatabasesResponse>, Status> {
+        self.lead()?;
         let caller = authorized(&request)?;
         let filter = request.get_ref();
         let requirements = filter
@@ -2065,7 +2194,7 @@ impl Control for ControlService {
             0 => usize::MAX,
             limit => usize::try_from(limit).unwrap_or(usize::MAX),
         };
-        let state = self.node.state();
+        let state = self.read().await?;
         let mut admitted = state
             .databases()
             .filter(|database| caller.sees(AuthAction::Read, database.name()))
@@ -2098,6 +2227,7 @@ impl Control for ControlService {
         &self,
         request: Request<AcquireLeaseRequest>,
     ) -> Result<Response<LeaseResponse>, Status> {
+        self.lead()?;
         let peer = Peer::of(&request);
         let request = request.into_inner();
         let database = parse("database name", &request.database)?;
@@ -2117,6 +2247,7 @@ impl Control for ControlService {
         &self,
         request: Request<RenewLeaseRequest>,
     ) -> Result<Response<LeaseResponse>, Status> {
+        self.lead()?;
         let peer = Peer::of(&request);
         let request = request.into_inner();
         let database = parse("database name", &request.database)?;
@@ -2140,8 +2271,10 @@ impl Control for ControlService {
         &self,
         request: Request<LeaveRequest>,
     ) -> Result<Response<LeaveResponse>, Status> {
-        let id = parse("node id", &request.get_ref().node_id)?;
+        self.lead()?;
+        let id: NodeId = parse("node id", &request.get_ref().node_id)?;
         Peer::of(&request).check_node(&id, "Leave")?;
+        self.refuse_removing_a_group_member(&request, &id)?;
         match self.submit(Action::Leave { id }).await? {
             (
                 Applied::MemberLeft {
@@ -2160,6 +2293,7 @@ impl Control for ControlService {
         &self,
         request: Request<StartPromotionRequest>,
     ) -> Result<Response<PromotionResponse>, Status> {
+        self.lead()?;
         let database = parse("database name", &request.get_ref().database)?;
         if let Some(node) = calling_node(&request)? {
             require_replica(&self.node.state(), "StartPromotion", &node, &database)?;
@@ -2186,6 +2320,7 @@ impl Control for ControlService {
         &self,
         request: Request<RecordFencedRequest>,
     ) -> Result<Response<RecordFencedResponse>, Status> {
+        self.lead()?;
         // The node named here is the fenced replica, reported by the candidate that fenced it,
         // so it is no claim about the caller's own identity; the caller must be the candidate.
         let caller = calling_node(&request)?;
@@ -2222,6 +2357,7 @@ impl Control for ControlService {
         &self,
         request: Request<CompletePromotionRequest>,
     ) -> Result<Response<CompletePromotionResponse>, Status> {
+        self.lead()?;
         let caller = calling_node(&request)?;
         let request = request.into_inner();
         let database = parse("database name", &request.database)?;
@@ -2257,6 +2393,7 @@ impl Control for ControlService {
         &self,
         request: Request<DrainRequest>,
     ) -> Result<Response<DrainResponse>, Status> {
+        self.lead()?;
         let id = parse("node id", &request.get_ref().node_id)?;
         Peer::of(&request).check_node(&id, "Drain")?;
         match self.submit(Action::Drain { id }).await? {
@@ -2271,6 +2408,7 @@ impl Control for ControlService {
         &self,
         request: Request<UndrainRequest>,
     ) -> Result<Response<UndrainResponse>, Status> {
+        self.lead()?;
         let id = parse("node id", &request.get_ref().node_id)?;
         match self.submit(Action::Undrain { id }).await? {
             (Applied::MemberUndrained { .. }, _) => Ok(Response::new(UndrainResponse {})),
@@ -2282,6 +2420,7 @@ impl Control for ControlService {
         &self,
         request: Request<TransferLeaseRequest>,
     ) -> Result<Response<PromotionResponse>, Status> {
+        self.lead()?;
         let database: DatabaseName = parse("database name", &request.get_ref().database)?;
         require_database(&request, &database)?;
         // Bound to `holder`: a node hands over only a lease it holds, as a draining node does.
@@ -2319,6 +2458,7 @@ impl Control for ControlService {
         &self,
         request: Request<RevokeTokenRequest>,
     ) -> Result<Response<RevokeTokenResponse>, Status> {
+        self.lead()?;
         let caller = revoke::who(&request);
         let revoker = revoke::Revoker::of(&request);
         let targets = revoke::Targets::from_request(request.into_inner());
@@ -2336,6 +2476,7 @@ impl Control for ControlService {
         &self,
         request: Request<DelegateTokenRequest>,
     ) -> Result<Response<DelegateTokenResponse>, Status> {
+        self.lead()?;
         let caller = Delegator::of(&request).inspect_err(|status| {
             let principal = match authorized(&request).map(Authorized::caller) {
                 Ok(Caller::Principal { name, .. }) => name.to_string(),
@@ -2363,6 +2504,7 @@ impl Control for ControlService {
         &self,
         request: Request<ListDelegationsRequest>,
     ) -> Result<Response<ListDelegationsResponse>, Status> {
+        self.lead()?;
         let request = request.into_inner();
         let recorded_by: Option<NodeId> = request
             .recorded_by
@@ -2371,7 +2513,7 @@ impl Control for ControlService {
             .transpose()?;
         let from = request.recorded_from_ms.map(Timestamp::from_millis);
         let to = request.recorded_to_ms.map(Timestamp::from_millis);
-        let state = self.node.state();
+        let state = self.read().await?;
         let now = self.clock.now().max(state.now());
         let delegations = state
             .delegations()
@@ -2392,6 +2534,7 @@ impl Control for ControlService {
         &self,
         request: Request<AddControlNodeRequest>,
     ) -> Result<Response<proto::ControlGroup>, Status> {
+        self.lead()?;
         let caller = revoke::who(&request);
         let change = self.clone().add_member(caller, request.into_inner());
         group::run_to_end(change).await.map(Response::new)
@@ -2401,6 +2544,7 @@ impl Control for ControlService {
         &self,
         request: Request<SetControlVotersRequest>,
     ) -> Result<Response<proto::ControlGroup>, Status> {
+        self.lead()?;
         let caller = revoke::who(&request);
         let change = self.clone().change_voters(caller, request.into_inner());
         group::run_to_end(change).await.map(Response::new)
@@ -2410,6 +2554,7 @@ impl Control for ControlService {
         &self,
         request: Request<RemoveControlNodeRequest>,
     ) -> Result<Response<proto::ControlGroup>, Status> {
+        self.lead()?;
         let caller = revoke::who(&request);
         let change = self.clone().remove_member(caller, request.into_inner());
         group::run_to_end(change).await.map(Response::new)
@@ -2419,6 +2564,7 @@ impl Control for ControlService {
         &self,
         _: Request<DescribeControlGroupRequest>,
     ) -> Result<Response<proto::ControlGroup>, Status> {
+        self.lead()?;
         self.describe().await.map(Response::new)
     }
 }
