@@ -247,20 +247,28 @@ A named set of client settings: a fleet name, the control addresses, the TLS fil
 - **See:** [Current context](#current-context).
 - **Not:** profile, target, environment, connection.
 
+### Control group
+
+The [control nodes](#control-node) that replicate the [control log](#control-log) with Raft: one by default, three or five in production. Its members are [voters](#voter) and [learners](#learner); one voter is the [leader](#leader) for each [term](#term) (ADR-0035, ADR-0040). A single control node is a group of one voter.
+
+- **Applies to:** daemon, CLI, UI.
+- **Code:** `ControlGroup`, `ControlHandle::group`, protocol `ControlGroup` and `DescribeControlGroup`, the `Raft` service; `[control] bootstrap`. **CLI:** `fleetring control add|set-voters|remove|list`; `control_group` in `/readyz`.
+- **Not:** cluster, quorum (a quorum is a majority of its voters), ensemble, control plane (the service, whatever runs it).
+
 ### Control log
 
-The control plane's durable, ordered list of commands, and the *control snapshot* it compacts into. Replaying it with `apply` rebuilds control state exactly (ADR-0017). It holds no key material.
+The control plane's durable, ordered list of commands, and the *control snapshot* it compacts into. Replaying it with `apply` rebuilds control state exactly (ADR-0017). Under a [control group](#control-group) it is the group's Raft log, whose committed command entries replay to the same state on every control node (ADR-0040 point 3). It holds no key material.
 
 - **Applies to:** daemon.
-- **Code:** `fleetring_control::Command`, `State`, `apply`. **CLI:** none.
-- **Not:** journal, WAL (a WAL belongs to a database), event log, Raft log (until Raft exists).
+- **Code:** `fleetring_control::Command`, `State`, `apply`; `ControlStore`. **CLI:** none.
+- **Not:** journal, WAL (a WAL belongs to a database), event log. The Raft log's membership and blank entries, and superseded command entries, which no control node applies, are in it but aren't commands.
 
 ### Control node
 
-A node that runs the control role: it holds the control log and answers control RPCs. Today a fleet has one; with Raft it will have three or five, of which one is the [leader](#leader).
+A node that runs the control role: it holds a copy of the control log and answers control RPCs, as a member of the [control group](#control-group). A fleet has one, or three or five, of which one is the [leader](#leader).
 
 - **Applies to:** daemon, CLI, UI.
-- **Code:** `NodeRole::Control` or `NodeRole::Both`. **CLI:** `--control <host:port>`, `role = "control"`.
+- **Code:** `NodeRole::Control` or `NodeRole::Both`. **CLI:** `--control <host:port>`, `role = "control"`, `[control] addresses`.
 - **Not:** master, coordinator, manager, controller, metadata server.
 
 ### Control plane
@@ -395,7 +403,7 @@ A number that only grows, used to order and fence. Always say which one:
 
 - **Applies to:** crate (membership epoch, as the ring's version), daemon, CLI, UI.
 - **Code and CLI:** as above; output headers say `epoch` only where the kind is clear from the command.
-- **Not:** term, generation (a generation is SQLite's, below the adapter), version (for a lease), round.
+- **Not:** term (a term is the control group's), generation (a generation is SQLite's, below the adapter), version (for a lease), round.
 
 ### Exit code
 
@@ -625,11 +633,19 @@ A `key=value` pair on a database, by the Kubernetes rules, for finding it again:
 
 ### Leader
 
-The control node that accepts control commands. Today the only control node; with Raft, the elected one, and others redirect to it. The word is reserved for the control plane.
+The control node that the [control group](#control-group) elected for its current [term](#term): it alone answers `Control` RPCs, and the other control nodes redirect to it. A single control node leads its own group of one. The word is reserved for the control group.
 
-- **Applies to:** daemon.
-- **Code:** `not_leader`, `LEADER_METADATA_KEY`. **CLI:** none.
+- **Applies to:** daemon, CLI.
+- **Code:** `not_leader`, `LEADER_METADATA_KEY`, `Readiness::Ready`, `ControlHandle::hand_over`. **CLI:** the `leader` column of `control list`; `leader` in `/readyz`.
 - **Not:** primary (that is a database's), master, coordinator.
+
+### Learner
+
+A member of the [control group](#control-group) that receives the control log but doesn't vote: a control node just added, catching up before `control set-voters` makes it a [voter](#voter) (ADR-0035 point 11).
+
+- **Applies to:** daemon, CLI.
+- **Code:** `ControlGroup::learners`, `fleetring_control_learners`. **CLI:** `control add`, `control remove`, the `voter` column of `control list`.
+- **Not:** observer, follower (a follower is a database's replica), standby.
 
 ### Lease
 
@@ -989,6 +1005,14 @@ The data plane's half of a [Hrana stream](#hrana-stream): one `Database.Session`
 - **Code:** `Database.Session`, `engine::SqlSessions`, `engine::SessionCall`, `SessionId`, `[sessions]`. **CLI:** none.
 - **Not:** connection (the HTTP or gRPC connection under it), transaction (a session can hold several, one at a time), cursor.
 
+### Settle window
+
+How long a new [leader](#leader) of the control group waits, from when it becomes ready, before it starts a [promotion](#promotion), retries a fork's seeding because its seeder looks down or its attempt is overdue, or releases a kept replica set: a lease duration plus the failover margin, on the monotonic clock (ADR-0040 point 6, amendment 3). Primaries renew under the new leader meanwhile. Fork actions that act on reports don't wait for it.
+
+- **Applies to:** daemon.
+- **Code:** `fleetring_control::fork::Settle`, the failover timer's window in `control/failover.rs`. **CLI:** none.
+- **Not:** grace period, lease (a lease is a database's), timeout.
+
 ### Signed head
 
 *Planned* (FR-074, ADR-0044). A database's chain hash at a position, signed by the node keys of a write quorum of its replicas, so anyone with the fleet's authority certificate can check offline that the fleet held that history. FR-074's ticket calls it a co-signed checkpoint; "checkpoint" stays the engine's.
@@ -1077,6 +1101,14 @@ Not a FleetRing object. A tenant is a naming convention for keys, `tenant:<name>
 - **Code:** none: no tenant type, flag, or RPC. **CLI:** none.
 - **Not:** a synonym for database, principal, or cell.
 
+### Term
+
+The [control group](#control-group)'s Raft term: the number of an election, which at most one [leader](#leader) wins. Always qualified, as "the control group's term" or "Raft term", never alone, and never for a lease epoch (ADR-0040).
+
+- **Applies to:** daemon, CLI.
+- **Code:** `LeaderRef::term`, `fleetring_control_term`, protocol `ControlGroup.term`. **CLI:** `term` in `control list`.
+- **Not:** epoch (an epoch fences a database or the membership), generation, round.
+
 ### Token
 
 A bearer credential: an Ed25519-signed JWT from the authority that names a principal, its scopes, and its lifetime. Its ID is `jti`; the signing key's ID is `kid`; from 0.8.0, `iat` is when it was signed. Since 0.8.0 (ADR-0047), a *delegated token* is a JWT a [delegation issuer](#delegation-issuer) signed, carrying its issuer certificate (`x5c`) and its [lineage](#lineage), and accepted only on a connection whose certificate names its principal or an ancestor. *Deferred after 0.8* (ADR-0044): a biscuit token, which a holder could narrow and delegate without the control plane.
@@ -1124,6 +1156,14 @@ Moving a node to another [release](#release): verify the release's signature and
 - **Applies to:** daemon, CLI, UI.
 - **Code:** `fleetringd::upgrade`, `upgrade::run`, `ProcessFile`, `Stop::Restart`. **CLI:** `fleetring upgrade`, `--version`, `--check`, `--no-restart`, `--rollback`, `--software`; `SIGHUP` restarts a daemon in place. A 0.6 binary installs 0.7 under its old name, `fleetringd`, and a 0.7 `upgrade` then adds the `fleetring` link beside it (ADR-0043, point 3).
 - **Not:** update, self-update, patch (a patch is one kind of release).
+
+### Voter
+
+A member of the [control group](#control-group) that votes in its elections and counts toward its quorums. A group has an odd number of voters, at most seven, and three or five in production; `control set-voters` names them (ADR-0035 point 11).
+
+- **Applies to:** daemon, CLI, UI.
+- **Code:** `ControlGroup::voters`, `fleetring_control_voters`, protocol `ControlNode.voter`. **CLI:** `control set-voters --voter <node>`, the `voter` column of `control list`.
+- **Not:** peer, replica. Say "member of the control group" for a voter or learner; a bare [member](#member) is the fleet's.
 
 ### Watcher
 
