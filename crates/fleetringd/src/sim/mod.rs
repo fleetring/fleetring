@@ -10,6 +10,9 @@
 //!   [`Daemon::start_with`](crate::Daemon::start_with) and
 //!   [`Environment::simulated`](crate::Environment::simulated). A host's data directory is a real
 //!   temporary directory that survives crashes; its memory doesn't.
+//!   [`FleetBuilder::control_group`] runs a control group of three or five control hosts
+//!   instead of one, formed as an operator forms it, and [`Fleet::finish`] then checks every
+//!   control host's log: each replays, they agree, and at most one host led each term.
 //! - [`Fault`]s partition and repair links, add latency or loss, and crash, stop, or restart
 //!   hosts.
 //! - [`Workload`]s run on client hosts and record every operation, as it is sent and as its

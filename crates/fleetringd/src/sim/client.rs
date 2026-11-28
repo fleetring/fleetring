@@ -61,7 +61,8 @@ pub(super) struct Via {
 /// What a client needs besides its workload.
 pub(super) struct Session {
     pub(super) name: String,
-    pub(super) control: String,
+    /// The control group's addresses, tried in order.
+    pub(super) control: Vec<String>,
     /// The data node database calls go to first, if not the primary the control plane names.
     pub(super) entry: Option<String>,
     /// The router writes and reads go through, if they go through one.
@@ -97,7 +98,7 @@ pub(super) async fn run_client(
         clients: BTreeMap::new(),
     };
     let network = Network::simulated().with_security(Security::Tls(identity));
-    let client = Client::new(control, network.clone()).with_backoff(CLIENT_BACKOFF);
+    let client = Client::at(control, network.clone()).with_backoff(CLIENT_BACKOFF);
     let client = match entry {
         Some(entry) => client.with_entry(entry),
         None => client,
@@ -153,6 +154,59 @@ pub(super) async fn run_client(
     Ok(())
 }
 
+/// What the client that forms a control group needs.
+pub(super) struct GroupSession {
+    /// The address of the control host that started the group.
+    pub(super) leader: String,
+    /// Each control host to add, and its address.
+    pub(super) joiners: Vec<(String, String)>,
+    /// Every control host, to make the voters.
+    pub(super) voters: Vec<String>,
+    /// An operator's identity: the group's RPCs need the `fleet` scope.
+    pub(super) identity: Identity,
+}
+
+/// How long the client that forms a control group waits before it tries a refused step again.
+const GROUP_RETRY: Duration = Duration::from_millis(100);
+
+/// Forms a control group as an operator would, through `fleetring control add` and `control
+/// set-voters`: adds each joiner as a learner, then makes every control host a voter. A step
+/// refused while a joiner starts, or before it has reported its software, is tried again.
+pub(super) async fn form_group(session: GroupSession) -> turmoil::Result {
+    let GroupSession {
+        leader,
+        joiners,
+        voters,
+        identity,
+    } = session;
+    let client = Network::simulated()
+        .with_security(Security::Tls(identity))
+        .control_client(leader)
+        .with_backoff(ONE_ATTEMPT);
+    for (node, address) in joiners {
+        loop {
+            let request = fleetring_proto::v1::AddControlNodeRequest {
+                node_id: node.clone(),
+                address: address.clone(),
+            };
+            match client.add_control_node(request).await {
+                Ok(_) => break,
+                Err(status) if status.message().contains("already a member") => break,
+                Err(_) => tokio::time::sleep(GROUP_RETRY).await,
+            }
+        }
+    }
+    loop {
+        let request = fleetring_proto::v1::SetControlVotersRequest {
+            voters: voters.clone(),
+        };
+        match client.set_control_voters(request).await {
+            Ok(_) => return Ok(()),
+            Err(_) => tokio::time::sleep(GROUP_RETRY).await,
+        }
+    }
+}
+
 /// One attempt per call: a workload's resends are operations of their own, in the history.
 const ONE_ATTEMPT: Backoff = Backoff {
     initial: Duration::from_millis(10),
@@ -183,7 +237,7 @@ fn delegated(response: DelegateTokenResponse) -> Result<Ack, tonic::Status> {
 /// for its node.
 struct NodeClients {
     authority: Arc<Authority>,
-    control: String,
+    control: Vec<String>,
     clients: BTreeMap<NodeId, ControlClient>,
 }
 
@@ -244,7 +298,7 @@ impl NodeClients {
                 });
             Network::simulated()
                 .with_security(Security::Tls(identity))
-                .control_client(self.control.clone())
+                .control_client_at(self.control.clone())
         });
         Some(client.clone())
     }
@@ -426,7 +480,7 @@ async fn execute(
             };
             match nodes.agent_network(certificate, token) {
                 Ok(network) => network
-                    .control_client(nodes.control.clone())
+                    .control_client_at(nodes.control.clone())
                     .with_backoff(ONE_ATTEMPT)
                     .revoke_token(request)
                     .await
@@ -451,7 +505,7 @@ async fn execute(
             };
             match nodes.agent_network(certificate, token) {
                 Ok(network) => network
-                    .control_client(nodes.control.clone())
+                    .control_client_at(nodes.control.clone())
                     .with_backoff(ONE_ATTEMPT)
                     .delegate_token(request)
                     .await
@@ -464,7 +518,7 @@ async fn execute(
             token,
             database,
         } => match nodes.agent_network(certificate, token) {
-            Ok(network) => Client::new(nodes.control.clone(), network)
+            Ok(network) => Client::at(nodes.control.clone(), network)
                 .with_backoff(ONE_ATTEMPT)
                 .query(database, Statement::new("SELECT 1"))
                 .await
@@ -476,7 +530,7 @@ async fn execute(
             token,
             database,
         } => match nodes.agent_network(certificate, token) {
-            Ok(network) => Client::new(nodes.control.clone(), network)
+            Ok(network) => Client::at(nodes.control.clone(), network)
                 .with_backoff(ONE_ATTEMPT)
                 .create_database_with(database, DatabaseSpec::new(ReplicationFactor::ONE))
                 .await

@@ -7,6 +7,7 @@ mod archive;
 mod binding;
 mod changes;
 mod control;
+mod control_group;
 mod database;
 mod delegation;
 mod determinism;

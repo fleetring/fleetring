@@ -685,6 +685,19 @@ impl Client {
         }
     }
 
+    /// A client that reaches the control group at any of `controls` (`host:port`), tried in
+    /// order, over `network` (ADR-0040 point 12).
+    #[must_use]
+    pub fn at(controls: Vec<String>, network: Network) -> Self {
+        Self {
+            control: network.control_client_at(controls),
+            network,
+            entry: None,
+            call_timeout: None,
+            channels: Arc::default(),
+        }
+    }
+
     /// Retries idempotent control calls with `backoff` instead of the default.
     #[must_use]
     pub fn with_backoff(mut self, backoff: Backoff) -> Self {

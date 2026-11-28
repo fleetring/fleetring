@@ -64,6 +64,13 @@ const MAX_LATENCY: Duration = Duration::from_millis(20);
 /// then the leave and the shutdown.
 const STOP_LIMIT: Duration = Duration::from_secs(30);
 
+/// How far behind the leader's committed log a control host may have applied and still count as
+/// converged: a few Raft heartbeats' worth of entries on a busy control plane.
+const CONVERGED_LAG: u64 = 16;
+
+/// How long a control group may take to form, in simulated time.
+const GROUP_LIMIT: Duration = Duration::from_secs(30);
+
 /// Mixed into the seed for the workload generator, so it doesn't mirror turmoil's.
 const WORKLOAD_SALT: u64 = 0x5EED_F1EE_7219_0024;
 
@@ -226,6 +233,8 @@ pub struct FleetBuilder {
     control_issuer: Option<String>,
     /// The rule the control node logs creations under, if not this release's own.
     incarnation_rule: Option<IncarnationRule>,
+    /// Whether the control hosts form a control group ([`FleetBuilder::control_group`]).
+    group: bool,
 }
 
 impl fmt::Debug for FleetBuilder {
@@ -273,6 +282,21 @@ impl FleetBuilder {
     #[must_use]
     pub fn control(self, name: &str) -> Self {
         self.host(name, NodeRole::Control)
+    }
+
+    /// Adds a control group of control-only hosts named `names` (ADR-0035, ADR-0040): the first
+    /// starts the group (`[control] bootstrap = "new"`), the others wait to be added (`"join"`),
+    /// and data hosts reach the group at every one of their addresses (`[control] addresses`).
+    /// [`FleetBuilder::build`] adds the others as learners and makes every one a voter, through
+    /// `AddControlNode` and `SetControlVoters` as an operator, and returns once the group has
+    /// converged. Control hosts then record each term they lead in the trace.
+    #[must_use]
+    pub fn control_group(mut self, names: &[&str]) -> Self {
+        for name in names {
+            self = self.host(name, NodeRole::Control);
+        }
+        self.group = true;
+        self
     }
 
     /// Adds a host that only hosts data.
@@ -389,7 +413,8 @@ impl FleetBuilder {
     /// not exactly one host runs the control plane; [`SimError::Io`] if the directories can't
     /// be created.
     pub fn build(self) -> Result<Fleet, SimError> {
-        let control = self.validate()?;
+        let controls = self.validate()?;
+        let control = controls.first().cloned().unwrap_or_default();
         let root = tempfile::tempdir()?;
         let sim = turmoil::Builder::new()
             .rng_seed(self.seed)
@@ -398,6 +423,10 @@ impl FleetBuilder {
             .max_message_latency(self.max_latency)
             .build();
         let control_address = SocketAddr::new(sim.lookup(control.as_str()), PORT);
+        let control_addresses: Vec<SocketAddr> = controls
+            .iter()
+            .map(|name| SocketAddr::new(sim.lookup(name.as_str()), PORT))
+            .collect();
         let fleet_name: FleetName = FLEET
             .parse()
             .map_err(|error: crate::tls::NameError| SimError::Invalid(error.to_string()))?;
@@ -411,6 +440,7 @@ impl FleetBuilder {
             shared: Shared::default(),
             hosts: Vec::new(),
             control,
+            controls: controls.clone(),
             down: BTreeSet::new(),
             clients: Vec::new(),
             watchers: Vec::new(),
@@ -436,8 +466,12 @@ impl FleetBuilder {
             std::fs::create_dir_all(&data_dir)?;
             let mut config = host_config(name, *role, data_dir.clone(), self.timings)?;
             config.node.advertise = Some(SocketAddr::new(fleet.sim.lookup(name.as_str()), PORT));
-            if !role.runs_control() {
+            if !role.runs_control() && self.group {
+                config.control.addresses.clone_from(&control_addresses);
+            } else if !role.runs_control() {
                 config.control.address = Some(control_address);
+            } else if self.group && *name != fleet.control {
+                config.control.bootstrap = crate::control::Bootstrap::Join;
             }
             if let Some(settings) = &self.replication {
                 config.replication = ReplicationConfig::from(settings);
@@ -494,18 +528,24 @@ impl FleetBuilder {
                     .insert(archive.clone(), Arc::clone(store));
             }
             shared.incarnation_rule = self.incarnation_rule;
+            shared.record_leaders = self.group;
         }
         for name in data_hosts {
             fleet.add_lease_watcher(&name);
         }
         if let Some(router) = &self.router {
+            // The first control host's address only: the router learns the rest (ADR-0040
+            // point 12, amendment 4).
             fleet.add_router(router, control_address)?;
+        }
+        if self.group {
+            fleet.form_group()?;
         }
         Ok(fleet)
     }
 
-    /// Returns the one host that runs the control plane.
-    fn validate(&self) -> Result<String, SimError> {
+    /// Returns the hosts that run the control plane, the one that starts the group first.
+    fn validate(&self) -> Result<Vec<String>, SimError> {
         let invalid = |reason: String| Err(SimError::Invalid(reason));
         let mut names = BTreeSet::new();
         for (name, _) in &self.hosts {
@@ -523,9 +563,12 @@ impl FleetBuilder {
             .map(|(name, _)| name.as_str())
             .collect();
         match control.as_slice() {
-            [one] => Ok((*one).to_owned()),
             [] => invalid("no host runs the control plane".into()),
-            many => invalid(format!("several hosts run the control plane: {many:?}")),
+            [one] => Ok(vec![(*one).to_owned()]),
+            many if self.group => Ok(many.iter().map(|name| (*name).to_owned()).collect()),
+            many => invalid(format!(
+                "several hosts run the control plane outside a control group: {many:?}"
+            )),
         }
     }
 }
@@ -693,7 +736,10 @@ pub struct Fleet {
     rng: SimRng,
     shared: Shared,
     hosts: Vec<HostInfo>,
+    /// The host that starts the control group, or the one control host.
     control: String,
+    /// Every host that runs the control plane, the one in `control` first.
+    controls: Vec<String>,
     /// Hosts the test crashed or stopped and hasn't restarted.
     down: BTreeSet<String>,
     /// Client hosts, in the order they were added.
@@ -765,6 +811,7 @@ impl Fleet {
             router: None,
             control_issuer: None,
             incarnation_rule: None,
+            group: false,
         }
     }
 
@@ -920,6 +967,126 @@ impl Fleet {
     #[must_use]
     pub fn control_log(&self) -> PathBuf {
         self.root.path().join(&self.control).join(CONTROL_DB)
+    }
+
+    /// Returns host `name`'s control log file.
+    #[must_use]
+    pub fn control_log_of(&self, name: &str) -> PathBuf {
+        self.root.path().join(name).join(CONTROL_DB)
+    }
+
+    /// Returns every host that runs the control plane, the one that started the group first.
+    #[must_use]
+    pub fn control_hosts(&self) -> &[String] {
+        &self.controls
+    }
+
+    /// Returns the control host that is the control group's ready leader now, if one is: of two
+    /// that both believe they lead, as an isolated old leader does, the one in the later term.
+    #[must_use]
+    pub fn control_leader(&self) -> Option<String> {
+        self.controls
+            .iter()
+            .filter_map(|host| {
+                let handle = self.shared.control_handle_of(host)?;
+                match handle.leadership() {
+                    crate::control::Readiness::Ready { leader } => Some((leader.term, host)),
+                    crate::control::Readiness::Follower { .. }
+                    | crate::control::Readiness::CatchingUp { .. } => None,
+                }
+            })
+            .max()
+            .map(|(_, host)| host.clone())
+    }
+
+    /// Returns a handle to the control node on host `name`, while it runs.
+    #[must_use]
+    pub fn control_handle_of(&self, name: &str) -> Option<ControlHandle> {
+        self.shared.control_handle_of(name)
+    }
+
+    /// Returns whether every control host the test hasn't crashed or stopped runs, one of them
+    /// leads, each names the same voters, and each has applied the leader's committed log to
+    /// within 16 entries, a few Raft heartbeats' worth on a busy control plane.
+    #[must_use]
+    pub fn control_converged(&self) -> bool {
+        let Some(leader) = self
+            .control_leader()
+            .and_then(|host| self.control_handle_of(&host))
+        else {
+            return false;
+        };
+        let voters = |handle: &ControlHandle| -> BTreeSet<String> {
+            handle
+                .group()
+                .voters()
+                .iter()
+                .map(|peer| peer.node_id.clone())
+                .collect()
+        };
+        let expected = voters(&leader);
+        let committed = leader.committed_index();
+        self.controls
+            .iter()
+            .filter(|host| !self.down.contains(*host))
+            .all(|host| {
+                self.control_handle_of(host).is_some_and(|handle| {
+                    voters(&handle) == expected
+                        && handle.applied().get().saturating_add(CONVERGED_LAG) >= committed
+                })
+            })
+    }
+
+    /// Steps until the control group has converged ([`Fleet::control_converged`]), and returns
+    /// how long that took.
+    ///
+    /// # Errors
+    ///
+    /// As [`Fleet::run_until`].
+    pub fn await_control_converged(&mut self, limit: Duration) -> Result<Duration, SimError> {
+        self.run_until(
+            limit,
+            "the control group converging",
+            Self::control_converged,
+        )
+    }
+
+    /// Adds a client that forms the control group, as an operator: it adds every control host
+    /// but the first as a learner and makes them all voters. Steps until the group has
+    /// converged with every control host a voter.
+    fn form_group(&mut self) -> Result<(), SimError> {
+        const NAME: &str = "group-operator";
+        let identity = self.client_identity(NAME);
+        let address = |host: &str| format!("{host}:{PORT}");
+        let session = crate::sim::client::GroupSession {
+            leader: address(&self.control),
+            joiners: self
+                .controls
+                .iter()
+                .skip(1)
+                .map(|host| (host.clone(), address(host)))
+                .collect(),
+            voters: self.controls.clone(),
+            identity,
+        };
+        self.clients.push(NAME.to_owned());
+        self.sim
+            .client(NAME, crate::sim::client::form_group(session));
+        let everyone: BTreeSet<String> = self.controls.iter().cloned().collect();
+        self.run_until(GROUP_LIMIT, "the control group forming", |fleet| {
+            fleet.control_converged()
+                && fleet.control_handle().is_some_and(|handle| {
+                    handle
+                        .group()
+                        .voters()
+                        .iter()
+                        .map(|peer| peer.node_id.clone())
+                        .collect::<BTreeSet<_>>()
+                        == everyone
+                })
+        })?;
+        self.note("control group formed");
+        Ok(())
     }
 
     fn host(&self, name: &str) -> Option<&HostInfo> {
@@ -1279,7 +1446,11 @@ impl Fleet {
         let identity = self.client_identity(name);
         let rng = self.rng.fork();
         let shared = self.shared.clone();
-        let control = format!("{}:{PORT}", self.control);
+        let control = self
+            .controls
+            .iter()
+            .map(|host| format!("{host}:{PORT}"))
+            .collect();
         let client = name.to_owned();
         self.clients.push(client.clone());
         if !workload.is_endless() {
@@ -1702,14 +1873,29 @@ impl Fleet {
     ///
     /// The first [`Violation`], or [`SimError::Invalid`] if the control node is running.
     pub fn check_control_log(&self) -> Result<ControlLog, SimError> {
-        if self.is_running(&self.control) {
-            return Err(SimError::Invalid(
-                "the control log is checked only while the control node is down".into(),
-            ));
+        self.check_control_log_of(&self.control)
+    }
+
+    /// Runs the invariants that need control host `name` down: its log replays to the state
+    /// recovery builds, and no two primaries shared an epoch. With one control host, its state
+    /// also holds every acknowledged control operation; in a control group a crashed follower may
+    /// lag the leader's commits, so the group's most complete log is checked for that at the end
+    /// of the run ([`Fleet::finish`]).
+    ///
+    /// # Errors
+    ///
+    /// The first [`Violation`], or [`SimError::Invalid`] if the host is running.
+    pub fn check_control_log_of(&self, name: &str) -> Result<ControlLog, SimError> {
+        if self.is_running(name) {
+            return Err(SimError::Invalid(format!(
+                "the control log of {name} is checked only while it is down"
+            )));
         }
-        let log = check::control_log_replays(&self.control_log())?;
+        let log = check::control_log_replays(&self.control_log_of(name))?;
         let history = self.history();
-        check::acknowledged_control_survives(log.state(), &history)?;
+        if self.controls.len() == 1 {
+            check::acknowledged_control_survives(log.state(), &history)?;
+        }
         check::one_primary_per_epoch(&history)?;
         Ok(log)
     }
@@ -2092,8 +2278,8 @@ impl Fleet {
                 self.isolated(host, |sim| sim.crash(host.as_str()));
                 self.down.insert(host.clone());
                 self.shared.lock().running.remove(host);
-                if *host == self.control {
-                    self.check_control_log()?;
+                if self.controls.contains(host) {
+                    self.check_control_log_of(host)?;
                 }
             }
             Fault::Stop { host } => {
@@ -2102,8 +2288,8 @@ impl Fleet {
                 let what = format!("{host} stopping");
                 let name = host.clone();
                 self.run_until(STOP_LIMIT, &what, |fleet| !fleet.is_running(&name))?;
-                if *host == self.control {
-                    self.check_control_log()?;
+                if self.controls.contains(host) {
+                    self.check_control_log_of(host)?;
                 }
             }
             Fault::Restart { host } => {
@@ -2279,35 +2465,32 @@ impl Fleet {
         stopped?;
         self.check_history()?;
         let _records = self.check_change_streams()?;
-        let log = self.check_control_log()?;
-        if let Some(control) = control
-            && *control.state() != log.state_at(control.applied().get())
-        {
-            return Err(Violation::new(
-                check::Invariant::ControlLogReplays,
-                "the replayed state differs from the state the control node last published, at \
-                 its index",
-            )
-            .into());
-        }
-        check::copies_kept_until_dropped(&log, &self.history(), |node, database| {
-            self.data_dir(node).is_some_and(|dir| {
-                dir.join(crate::daemon::DATABASES_DIR)
-                    .join(crate::layout::database_dir(database))
-                    .exists()
-            })
-        })?;
-        let trace = self.trace();
+        let log = self.check_control_logs(control.as_ref())?;
         let history = self.history();
-        check::lease_events_match_control(&history, log.lease_holders())?;
-        let disk = self.fork_disk(&log);
-        crate::sim::forks::check(
-            log.replayed_from(),
-            log.commands(),
-            &history,
-            &disk,
-            &self.fork_expectations,
-        )?;
+        if log.from_genesis() {
+            check::copies_kept_until_dropped(&log, &history, |node, database| {
+                self.data_dir(node).is_some_and(|dir| {
+                    dir.join(crate::daemon::DATABASES_DIR)
+                        .join(crate::layout::database_dir(database))
+                        .exists()
+                })
+            })?;
+            check::lease_events_match_control(&history, log.lease_holders())?;
+            let disk = self.fork_disk(&log);
+            crate::sim::forks::check(
+                log.replayed_from(),
+                log.commands(),
+                &history,
+                &disk,
+                &self.fork_expectations,
+            )?;
+        } else {
+            self.note(
+                "the control log was purged: the checks that replay it from genesis were skipped \
+                 (copies kept until dropped, lease events, and the fork properties)",
+            );
+        }
+        let trace = self.trace();
         Ok(Report {
             trace,
             history,
@@ -2317,6 +2500,50 @@ impl Fleet {
 }
 
 impl Fleet {
+    /// Replays every control host's log once every host has stopped, and checks the control
+    /// invariants over them: each log replays ([`check::control_log_replays`]), the logs agree
+    /// ([`check::logs_agree`]), at most one host led each term ([`check::one_leader_per_term`]),
+    /// the most complete log holds every acknowledged control operation, and `control`, the
+    /// handle the run's last leader published through, published the state its
+    /// own log replays to at its index. Returns the most complete log, which the checks that
+    /// follow read.
+    fn check_control_logs(&self, control: Option<&ControlHandle>) -> Result<ControlLog, SimError> {
+        let history = self.history();
+        let paths: Vec<(String, PathBuf)> = self
+            .controls
+            .iter()
+            .map(|host| (host.clone(), self.control_log_of(host)))
+            .collect();
+        let named: Vec<(&str, &Path)> = paths
+            .iter()
+            .map(|(host, path)| (host.as_str(), path.as_path()))
+            .collect();
+        let logs = check::control_logs_agree(&named)?;
+        check::one_leader_per_term(&self.trace())?;
+        check::one_primary_per_epoch(&history)?;
+        // Every host is named by its node ID.
+        if let Some(control) = control
+            && let published = control.own().node_id.as_str()
+            && let Some((_, log)) = logs.iter().find(|(host, _)| *host == published)
+            && *control.state() != log.state_at(control.applied().get())
+        {
+            return Err(Violation::new(
+                check::Invariant::ControlLogReplays,
+                format!(
+                    "the replayed state differs from the state {published} last published, at its \
+                     index"
+                ),
+            )
+            .into());
+        }
+        let (_, log) = logs
+            .into_iter()
+            .max_by_key(|(_, log)| (log.committed(), log.from_genesis()))
+            .ok_or_else(|| SimError::Invalid("the fleet has no control host".into()))?;
+        check::acknowledged_control_survives(log.state(), &history)?;
+        Ok(log)
+    }
+
     /// Every data host's copies of each database a fork in `log` involves, and its staged
     /// copies, read from disk.
     fn fork_disk(&self, log: &ControlLog) -> ForkDisk {

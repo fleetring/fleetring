@@ -67,6 +67,9 @@ pub(super) struct Inner {
     /// The rule the control node logs creations under, when the test stands it in for one of a
     /// release before 0.8.1; `None` for this release's own.
     pub(super) incarnation_rule: Option<IncarnationRule>,
+    /// Whether control hosts record each term they lead in the trace: in fleets with a control
+    /// group, whose checks read it ([`check::one_leader_per_term`](crate::sim::check::one_leader_per_term)).
+    pub(super) record_leaders: bool,
 }
 
 /// What a running host exposes.
@@ -121,11 +124,33 @@ impl Shared {
         }
     }
 
+    /// The handle of the running control node that is the control group's ready leader in the
+    /// latest term, or of the first running control node while none is.
     pub(super) fn control_handle(&self) -> Option<ControlHandle> {
-        self.lock()
+        let inner = self.lock();
+        let handles = inner
             .running
             .values()
-            .find_map(|running| running.control.clone())
+            .filter_map(|running| running.control.as_ref());
+        let first = handles.clone().next();
+        handles
+            .filter_map(|handle| match handle.leadership() {
+                crate::control::Readiness::Ready { leader } => Some((leader.term, handle)),
+                crate::control::Readiness::Follower { .. }
+                | crate::control::Readiness::CatchingUp { .. } => None,
+            })
+            .max_by_key(|(term, _)| *term)
+            .map(|(_, handle)| handle)
+            .or(first)
+            .cloned()
+    }
+
+    /// The handle of the control node on host `name`, while it runs.
+    pub(super) fn control_handle_of(&self, name: &str) -> Option<ControlHandle> {
+        self.lock()
+            .running
+            .get(name)
+            .and_then(|running| running.control.clone())
     }
 
     pub(super) fn signal_stop(&self, host: &str) {
@@ -214,6 +239,29 @@ pub(super) async fn run_host(
         },
     );
     shared.record(&name, EventKind::Started);
+    let record_leaders = shared.lock().record_leaders;
+    if let Some(control) = daemon.control().filter(|_| record_leaders) {
+        let shared = shared.clone();
+        let name = name.clone();
+        let mut leadership = control.watch_leadership();
+        tokio::spawn(async move {
+            loop {
+                let current = leadership.borrow_and_update().clone();
+                if let crate::control::Readiness::Ready { leader } = current {
+                    shared.record(
+                        &name,
+                        EventKind::Leader {
+                            term: leader.term,
+                            leader: name.clone(),
+                        },
+                    );
+                }
+                if leadership.changed().await.is_err() {
+                    return;
+                }
+            }
+        });
+    }
     if let Some(mut membership) = membership {
         let shared = shared.clone();
         let name = name.clone();

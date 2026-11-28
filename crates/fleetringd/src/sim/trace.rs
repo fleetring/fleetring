@@ -92,6 +92,14 @@ pub enum EventKind {
     Lease(LeaseObservation),
     /// A free-form note from the test.
     Note(String),
+    /// A control host became the control group's ready leader for a term (ADR-0040 point 2):
+    /// recorded in fleets with a control group, by the host that leads.
+    Leader {
+        /// The control group's term.
+        term: u64,
+        /// The host that leads it.
+        leader: String,
+    },
 }
 
 impl fmt::Display for EventKind {
@@ -123,6 +131,7 @@ impl fmt::Display for EventKind {
                 observation.epoch().get()
             ),
             Self::Note(note) => write!(f, "note {note}"),
+            Self::Leader { term, leader } => write!(f, "{leader} leads term {term}"),
         }
     }
 }
