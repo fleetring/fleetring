@@ -1686,11 +1686,22 @@ async fn db_fork_forks_and_never_returns_the_sources_description_or_a_token() ->
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[cfg(feature = "fault-hooks")]
-#[ignore = "waits out the 60 s MCP call limit; run with --ignored"]
 async fn db_fork_does_not_report_success_while_the_reset_is_held() -> TestResult {
     let dir = tempfile::tempdir()?;
     let node = Node::start_with(dir.path(), Setup::Forking).await?;
-    let mut mcp = node.mcp(&[]).await?;
+    // A short call limit: `db_fork` waits out the limit less its resend window and margin (15 s)
+    // before it reports the fork as not ready, which takes 60 s less that at the default.
+    let mut mcp = start_session(
+        node.tls.dir(),
+        &[
+            ("FLEETRING_CONTROL", node.control.as_str()),
+            ("FLEETRING_AS", AGENT),
+            ("FLEETRING_TOKEN", &node.token),
+            ("FLEETRING_MCP_CALL_TIMEOUT_MS", "20000"),
+        ],
+        &[],
+    )
+    .await?;
     mcp.ok(
         "db_create",
         json!({"name": "agent-42-src", "replication_factor": 1}),
@@ -1706,17 +1717,33 @@ async fn db_fork_does_not_report_success_while_the_reset_is_held() -> TestResult
         )
         .await?;
     assert_eq!(forked["ready"], false, "{forked}");
-    assert_eq!(forked["status"], "seeded", "{forked}");
     assert!(
         forked["hint"]
             .as_str()
             .is_some_and(|step| step.contains("db_show")),
         "{forked}"
     );
+    // Seeding takes a few seconds, which the short call limit may not cover. Waiting again with
+    // the same operation ID follows the same fork until its copy is staged and the held reset
+    // keeps it seeded; it is never reported ready meanwhile.
+    let operation = forked["operation_id"].clone();
+    let mut forked = forked;
+    for _ in 0..6 {
+        if forked["status"] == "seeded" {
+            break;
+        }
+        forked = mcp
+            .ok(
+                "db_fork",
+                json!({"source": "agent-42-src", "name": "agent-42-copy", "replication_factor": 1, "operation_id": operation}),
+            )
+            .await?;
+        assert_eq!(forked["ready"], false, "{forked}");
+    }
+    assert_eq!(forked["status"], "seeded", "{forked}");
     for faults in &node.faults {
         faults.release(FaultPoint::BeforeReset);
     }
-    let operation = forked["operation_id"].clone();
     let again = mcp
         .ok(
             "db_fork",

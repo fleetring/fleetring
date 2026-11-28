@@ -317,6 +317,27 @@ fn unwrapped(schema: &JsonObject) -> Arc<JsonObject> {
     }
 }
 
+/// The environment variable that shortens [`CALL_TIMEOUT`], in milliseconds, in a build with the
+/// `fault-hooks` feature. A release build without the feature never reads it.
+#[cfg(feature = "fault-hooks")]
+const CALL_TIMEOUT_MS_VAR: &str = "FLEETRING_MCP_CALL_TIMEOUT_MS";
+
+/// How long one tool call may take: [`CALL_TIMEOUT`], or in a `fault-hooks` build the
+/// milliseconds `FLEETRING_MCP_CALL_TIMEOUT_MS` names, so tests needn't wait out a full call.
+#[cfg(feature = "fault-hooks")]
+fn call_timeout() -> Duration {
+    std::env::var(CALL_TIMEOUT_MS_VAR)
+        .ok()
+        .and_then(|millis| millis.parse().ok())
+        .map_or(CALL_TIMEOUT, Duration::from_millis)
+}
+
+/// How long one tool call may take: [`CALL_TIMEOUT`].
+#[cfg(not(feature = "fault-hooks"))]
+const fn call_timeout() -> Duration {
+    CALL_TIMEOUT
+}
+
 /// How long `db_fork` may spend sending its request again after a lost reply.
 const FORK_RESEND_WINDOW: Duration = Duration::from_secs(10);
 
@@ -393,13 +414,13 @@ impl FleetringMcp {
         true
     }
 
-    /// Runs `tool` within [`CALL_TIMEOUT`].
+    /// Runs `tool` within [`call_timeout`].
     async fn run_timed(
         &self,
         tool: ToolName,
         arguments: JsonObject,
     ) -> Result<serde_json::Value, Failed> {
-        match tokio::time::timeout(CALL_TIMEOUT, self.run(tool, arguments)).await {
+        match tokio::time::timeout(call_timeout(), self.run(tool, arguments)).await {
             Ok(outcome) => outcome,
             Err(_elapsed) => Err(Failed::TimedOut),
         }
@@ -550,7 +571,7 @@ impl FleetringMcp {
                     })?
             }
         };
-        let wait = CALL_TIMEOUT
+        let wait = call_timeout()
             .saturating_sub(FORK_RESEND_WINDOW)
             .saturating_sub(FORK_MARGIN);
         let status = match fork_flow::follow(
@@ -1154,7 +1175,7 @@ impl Failed {
                 "deadline_exceeded",
                 format!(
                     "the call took longer than {}s; a write may or may not have taken effect",
-                    CALL_TIMEOUT.as_secs()
+                    call_timeout().as_secs()
                 ),
                 None,
             ),
