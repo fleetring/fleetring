@@ -262,6 +262,18 @@ impl ControlClient {
         addresses.advance(&current);
     }
 
+    /// Moves the client on from `failed`, an address [`ControlClient::leader`] returned before a
+    /// call that the caller's deadline ended, but only if the client still calls it. Callers that
+    /// time out together, each having captured the same address, move the client on once, rather
+    /// than each one step further, round the list and back to the address that hangs.
+    ///
+    /// # Panics
+    ///
+    /// If the client's lock was poisoned by a panic in another thread.
+    pub fn advance_from(&self, failed: &str) {
+        self.addresses().advance(failed);
+    }
+
     /// Drops every connection the client holds, so the next call dials again, and moves on to
     /// the next address, as [`ControlClient::advance`] does.
     ///

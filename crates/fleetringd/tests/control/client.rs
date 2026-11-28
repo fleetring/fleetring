@@ -166,6 +166,27 @@ async fn the_client_learns_the_group_and_keeps_the_address_that_answers() -> Tes
     Ok(())
 }
 
+/// Callers whose deadlines end together, each having noted the address it called, move the
+/// client on once: `advance_from` moves only from an address the client still calls, where
+/// `advance` would move it once per caller, round three addresses and back to the hung one.
+#[test]
+fn concurrent_timeouts_move_the_client_on_once() {
+    let addresses = ["127.0.0.1:1", "127.0.0.1:2", "127.0.0.1:3"];
+    let client = ControlClient::with_addresses(
+        addresses.iter().map(ToString::to_string).collect(),
+        TransportConfig::default(),
+    );
+    let asked = client.leader();
+    for _ in 0..3 {
+        client.advance_from(&asked);
+    }
+    assert_eq!(client.leader(), addresses[1]);
+    for _ in 0..3 {
+        client.advance();
+    }
+    assert_eq!(client.leader(), addresses[1], "advance goes round the list");
+}
+
 /// A call sent once per leader goes on to the next address when the first refuses the
 /// connection, since nothing received it: here it reaches the stub, which doesn't serve it.
 #[tokio::test]

@@ -572,6 +572,22 @@ impl ControlService {
             .collect()
     }
 
+    /// The control group's addresses, with the leader's marked, for a `Locate` reply: what a
+    /// router's control client learns, and nothing more. Any caller that may read a database
+    /// sees them, so node IDs, voter flags, matched indexes, and software, which
+    /// `DescribeControlGroup` gives only to the `fleet` scope, are left out (ADR-0040,
+    /// amendment 4).
+    fn control_addresses(&self) -> Vec<fleetring_proto::v1::ControlNode> {
+        self.control_nodes()
+            .into_iter()
+            .map(|node| fleetring_proto::v1::ControlNode {
+                address: node.address,
+                leader: node.leader,
+                ..fleetring_proto::v1::ControlNode::default()
+            })
+            .collect()
+    }
+
     /// Refuses a principal's `Leave` of a voter or learner of the control group, which
     /// `fleetring node remove` sends (ADR-0040 point 9, decision D7): a dead voter it left in
     /// place would silently count toward every quorum. A node's own `Leave` under its
@@ -2204,6 +2220,7 @@ impl Control for ControlService {
         }
         Ok(Response::new(LocateResponse {
             placement: Some(placement),
+            control_nodes: self.control_addresses(),
         }))
     }
 

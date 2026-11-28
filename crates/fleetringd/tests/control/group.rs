@@ -13,7 +13,7 @@ use fleetring_proto::v1::{
     ListDatabasesRequest, ListDelegationsRequest, LocateRequest, RemoveControlNodeRequest,
     SetControlVotersRequest, WatchMembershipRequest,
 };
-use fleetringd::control::{ControlClient, ControlOptions, ControlService};
+use fleetringd::control::{ControlClient, ControlOptions, ControlService, GroupError};
 use fleetringd::dev::DevMode;
 use fleetringd::transport::TransportConfig;
 use fleetringd::{Config, Daemon};
@@ -550,6 +550,27 @@ async fn a_leader_hands_over_to_a_voter_that_answers() -> TestResult {
     let leader = handle(&c1).hand_over().await.ok_or("nobody took over")?;
     assert_eq!(leader.node_id, "c3");
     stop([c1, c3]).await;
+    Ok(())
+}
+
+/// `control add` refuses an address the membership records for another member, before it probes
+/// anything: two members at one address would let one node answer for both.
+#[tokio::test]
+async fn add_refuses_an_address_another_member_holds() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let c1 = start_plaintext(dir.path(), "c1", "new").await?;
+    let c2 = start_plaintext(dir.path(), "c2", "join").await?;
+    add(&c1, &[("c2", &c2)]).await?;
+    for (node, at) in [("c3", address(&c2)), ("c4", address(&c1))] {
+        let refused = handle(&c1).add_node(node, &at).await;
+        let Err(GroupError::Invalid { reason }) = refused else {
+            panic!("expected a refusal of {node} at {at}: {refused:?}");
+        };
+        assert!(reason.contains("records"), "{reason}");
+    }
+    assert!(!handle(&c1).group().contains("c3"));
+    assert!(!handle(&c1).group().contains("c4"));
+    stop([c1, c2]).await;
     Ok(())
 }
 

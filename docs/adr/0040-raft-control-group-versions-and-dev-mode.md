@@ -1,6 +1,6 @@
 # ADR-0040: The Raft control group screens commands on its leader against the log it will commit, owns its storage and wire formats, and draws openraft's randomness from an injected generator (amends ADR-0035)
 
-- **Status:** Accepted (2026-11-25, by the owner, with decisions D1 to D9 as recommended; see [Owner decisions](#owner-decisions-2026-11-25)); points 2 and 6 amended by [amendment 1](#amendment-1-2026-11-26-one-batch-in-flight-and-a-discarded-entrys-outcome-is-unknown) (accepted 2026-11-26); points 3, 4, 5, 9, and 11 amended by [amendment 2](#amendment-2-2026-11-28-leader-hand-over-the-probes-certificate-check-and-d7-on-plaintext) (proposed 2026-11-28); point 6 amended by [amendment 3](#amendment-3-2026-11-28-fork-actions-that-act-on-reports-dont-wait-out-the-settle-window) (proposed 2026-11-28)
+- **Status:** Accepted (2026-11-25, by the owner, with decisions D1 to D9 as recommended; see [Owner decisions](#owner-decisions-2026-11-25)); points 2 and 6 amended by [amendment 1](#amendment-1-2026-11-26-one-batch-in-flight-and-a-discarded-entrys-outcome-is-unknown) (accepted 2026-11-26); points 3, 4, 5, 9, and 11 amended by [amendment 2](#amendment-2-2026-11-28-leader-hand-over-the-probes-certificate-check-and-d7-on-plaintext) (proposed 2026-11-28); point 6 amended by [amendment 3](#amendment-3-2026-11-28-fork-actions-that-act-on-reports-dont-wait-out-the-settle-window) (proposed 2026-11-28); points 9, 11, and 12 amended by [amendment 4](#amendment-4-2026-11-28-the-router-learns-the-group-from-locate-and-a-member-moves-to-a-new-address) (proposed 2026-11-28)
 - **Date:** 2026-11-04 (revised on 2026-11-25 against `main` at 0.9.0, before acceptance)
 - **Related:** ADR-0035 (amends points 1, 3, 4, 5, 6, 7, 8, 9, 11, 12, 13, 14, and 15), ADR-0017, ADR-0018, ADR-0020, ADR-0022, ADR-0026, ADR-0031 (amendment 2), ADR-0034, ADR-0038, ADR-0039, ADR-0043, ADR-0046 (FR-110 amendment), ADR-0047, ADR-0050; tickets FR-064 (#67), FR-065 (#68), FR-127 (#216), FR-128 (#217)
 
@@ -256,6 +256,19 @@ Point 6 gated "fork actions" with promotions and kept-set releases, because each
 4. **What stays gated.** Starting a promotion still waits out the window, since it acts on liveness and leases, which a new leader's state shows stale. Releasing a kept replica set waits too, by the owner's choice on FR-118, pending a follow-up: it has the shape of the now-ungated `ReleaseForkHolders`, a lease holder's report at the lease's epoch and the current membership epoch, with no liveness and no time, so the same argument would exempt it. Notices for promotions in progress go out at once, as before.
 
 `fleetring-control`'s `apply`, `State`, `Command`, and their serde forms don't change; only the driver's signature does. A replay of the control log doesn't run the driver, so replays are unaffected.
+
+## Amendment 4 (2026-11-28): the router learns the group's addresses from `Locate`
+
+- **Status:** Proposed (2026-11-28, with FR-064's PR 6; for the owner to accept).
+- **Amends:** point 11's list of protocol 1.4's fields, and point 12's learning.
+
+PRs 4 and 5 left the router without the group's addresses: it calls only `Locate`, whose reply named no group, so it never learned more than the address it was configured with.
+
+1. **`LocateResponse.control_nodes = 2`** (adds to point 11). It carries one entry per voter and learner of the control group, with only `address` and `leader` set: the leader's address marked, and every other field of `ControlNode` (the node ID, the voter flag, the matched index, and the software) left empty. The field is additive and joins protocol 1.4, which no release has shipped, so the protocol version doesn't change.
+2. **The router and the data client behind `fleetring db` learn from it** as data nodes learn from heartbeat replies (point 12): the addresses join those tried once an address fails, the leader's first, and the client keeps calling the address that answers. A router `Locate` that doesn't answer within a second moves the client on from the address it was sent to, and only from that one, so concurrent timeouts move it once.
+3. **What it discloses.** Any caller that may read a database learns where the control nodes listen and which of them leads. A fleet's control addresses are no secret, since every client is configured with at least one. What `DescribeControlGroup` gives only to the `fleet` scope, the members' node IDs, roles, progress, and releases, stays out of the reply.
+
+Moving a member to a new address, which an earlier draft of this amendment proposed, is left for a later amendment: its guards need `Probe` to report the node's membership and last log ID, a check that the old address no longer answers as the node, and the target's Raft ID in every Raft request.
 
 ## Alternatives considered
 

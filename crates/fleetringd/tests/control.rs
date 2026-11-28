@@ -300,13 +300,27 @@ async fn a_control_daemon_runs_the_lease_lifecycle_through_the_client() -> TestR
         .await?;
     assert!(renewed.expires_at_ms >= lease.expires_at_ms);
 
-    let located = control
+    let reply = control
         .locate(LocateRequest {
             database: "tenant:acme".into(),
         })
-        .await?
-        .placement
-        .ok_or("no placement")?;
+        .await?;
+    // The reply names the control group's addresses, so a router that only locates learns them
+    // too, and nothing else: node IDs, voters, and software are for the `fleet` scope.
+    assert!(
+        matches!(
+            reply.control_nodes.as_slice(),
+            [only] if only.leader
+                && !only.address.is_empty()
+                && only.node_id.is_empty()
+                && !only.voter
+                && only.matched_index == 0
+                && only.software.is_none()
+        ),
+        "{:?}",
+        reply.control_nodes
+    );
+    let located = reply.placement.ok_or("no placement")?;
     assert_eq!(located.primary.as_deref(), Some(primary.as_str()));
     assert_eq!(located.epoch, 1);
     assert_eq!(located.engine, i32::from(Engine::Sqlite));

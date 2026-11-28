@@ -712,6 +712,11 @@ message ListDatabasesResponse {
 
 message LocateResponse {
   Placement placement = 1;
+  // The address of each voter and learner of the control group, with the leader's marked, so a
+  // router that only locates databases can reach the group at any of its addresses (ADR-0040
+  // point 12, amendment 4). Only `address` and `leader` are set: any caller that may read the
+  // database sees them. Empty from a control node that predates the field.
+  repeated ControlNode control_nodes = 2;
 }
 
 message Placement {
