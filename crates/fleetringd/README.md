@@ -497,6 +497,8 @@ A token is checked when a request arrives, and a stream opened with one (`WatchL
 | `Database.WatchChanges` | stream on the database | — |
 | `Database.Session` | read on the database | — |
 
+`Raft.TransferLeader` is the control group's fifth Raft call (ADR-0040, amendment 2): a leader sends it to the voter it hands its leadership to when it stops gracefully, or when `fleetring control set-voters` leaves it out of the voters.
+
 ## Observability
 
 A running daemon offers three things an operator collects: metrics, health and readiness probes, and logs (ADR-0034).

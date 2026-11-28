@@ -1,6 +1,6 @@
 # ADR-0040: The Raft control group screens commands on its leader against the log it will commit, owns its storage and wire formats, and draws openraft's randomness from an injected generator (amends ADR-0035)
 
-- **Status:** Accepted (2026-11-25, by the owner, with decisions D1 to D9 as recommended; see [Owner decisions](#owner-decisions-2026-11-25)); points 2 and 6 amended by [amendment 1](#amendment-1-2026-11-26-one-batch-in-flight-and-a-discarded-entrys-outcome-is-unknown) (accepted 2026-11-26)
+- **Status:** Accepted (2026-11-25, by the owner, with decisions D1 to D9 as recommended; see [Owner decisions](#owner-decisions-2026-11-25)); points 2 and 6 amended by [amendment 1](#amendment-1-2026-11-26-one-batch-in-flight-and-a-discarded-entrys-outcome-is-unknown) (accepted 2026-11-26); points 3, 4, 5, 9, and 11 amended by [amendment 2](#amendment-2-2026-11-28-leader-hand-over-the-probes-certificate-check-and-d7-on-plaintext) (proposed 2026-11-28)
 - **Date:** 2026-11-04 (revised on 2026-11-25 against `main` at 0.9.0, before acceptance)
 - **Related:** ADR-0035 (amends points 1, 3, 4, 5, 6, 7, 8, 9, 11, 12, 13, 14, and 15), ADR-0017, ADR-0018, ADR-0020, ADR-0022, ADR-0026, ADR-0031 (amendment 2), ADR-0034, ADR-0038, ADR-0039, ADR-0043, ADR-0046 (FR-110 amendment), ADR-0047, ADR-0050; tickets FR-064 (#67), FR-065 (#68), FR-127 (#216), FR-128 (#217)
 
@@ -210,6 +210,26 @@ The review checked point 2 against openraft 0.10.1's source and found two places
    - `ForwardToLeader`, which openraft gives a proposal it never appended (no longer leader, or the lease refusal above), keeps its meaning: nothing happened, `NotLeader`.
 
    The proposals metric counts `Unknown` as `not_leader`, so the closed set of point 10 doesn't change.
+
+## Amendment 2 (2026-11-28): leader hand-over, the probe's certificate check, and D7 on plaintext
+
+- **Status:** Proposed (2026-11-28, with FR-064's PR 5, after an independent review of it; for the owner to accept).
+- **Amends:** point 3's and point 11's lists of the `Raft` service's calls, point 4's checks before a node is added, point 5's leader hand-over, and point 9's refusal of a principal's `Leave` (decision D7). The accepted text above stands; this amendment adds to it.
+
+Building PR 5 against openraft 0.10.1 showed that the hand-over of point 5 needs a call the accepted points don't list, and that openraft treats a leader demoted by a membership change differently from what point 5 assumed. It also settled two details points 4 and 9 left open.
+
+1. **`Raft.TransferLeader` is the service's fifth call** (adds to points 3 and 11). openraft's `trigger().transfer_leader` reaches the target through `RaftNetworkV2::transfer_leader`, whose default answers `Unreachable`, so without the call a transfer can't succeed. Like the other calls it is a `node` call bound to `control peer`. Its payload is FleetRing's JSON, as point 3 requires:
+   - the request `TransferLeaderWire { from_leader: <vote>, to: "<hex>", last_log_id: <log id or null> }`;
+   - the reply `TransferLeaderReply`, tagged by `result`: `accepted`, `vote_changed { expected, actual }`, or `log_not_flushed { expected, actual }`.
+
+   Four golden vectors pin both forms in `raft-wire-v1`: `transfer-leader.json`, `transfer-leader-reply-accepted.json`, `transfer-leader-reply-vote-changed.json`, and `transfer-leader-reply-log-not-flushed.json`. The receiver refuses, with `PERMISSION_DENIED`, a request whose `from_leader` names another node than the caller's certificate. A member that sends its own vote rather than the leader's changes nothing, because openraft ignores a transfer whose vote isn't the one the receiver holds. The call joins protocol 1.4, which no release has shipped, so the protocol version doesn't change.
+2. **When a leader hands over** (extends point 5).
+   - A leader that shuts down gracefully hands its leadership to the most caught-up of its other voters that it heard from within one election timeout, by the leader's matched index, with the lowest Raft ID among equals. It waits at most the longest election timeout, then stops anyway. A voter that is down is never chosen, and with no other voter heard nothing is handed over.
+   - The daemon hands over while its server still answers, so the new leader's first messages reach it. It doesn't try again once the server has stopped.
+   - **`set-voters` hands over too when the new voters leave the leader out.** openraft 0.10.1 lets a leader that a membership change leaves as a learner keep leading; only one removed from the membership altogether steps down (`removed_leader_step_down`). A group whose leader doesn't vote loses that leader at its next restart anyway, so the change hands over at once.
+   - The answer to a group change is the group as the node that made the change then knows it, read without a read round. A change that handed the leadership over is therefore never redirected and sent again.
+3. **The leader checks the certificate of a node it adds** (extends point 4). A `Probe` reply names its node only as that node says, so before it adds a node the leader makes one TLS handshake of its own to the address. It refuses the node unless the server's certificate names the node the operator asked for. On a plaintext fleet nothing names the server, and the check passes. The check pins the node's identity only when it is added. After that the `control peer` binding judges each call by the caller's certificate, and certificates that mark a node as a control node stay a later decision (ADR-0035 point 13).
+4. **D7 on a plaintext fleet** (qualifies point 9). `Leave` is refused when the request boundary resolved the caller as a principal, or when the request carries no boundary context at all (the refusal fails closed). An anonymous `Leave` on a plaintext fleet passes, because nothing tells a node's own leave from an operator's. Only `insecure_plaintext` and the simulation run so. The refusal is audited with the principal and its credential.
 
 ## Alternatives considered
 
