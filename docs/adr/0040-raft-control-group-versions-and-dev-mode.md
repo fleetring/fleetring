@@ -1,6 +1,6 @@
 # ADR-0040: The Raft control group screens commands on its leader against the log it will commit, owns its storage and wire formats, and draws openraft's randomness from an injected generator (amends ADR-0035)
 
-- **Status:** Accepted (2026-11-25, by the owner, with decisions D1 to D9 as recommended; see [Owner decisions](#owner-decisions-2026-11-25)); points 2 and 6 amended by [amendment 1](#amendment-1-2026-11-26-one-batch-in-flight-and-a-discarded-entrys-outcome-is-unknown) (accepted 2026-11-26); points 3, 4, 5, 9, and 11 amended by [amendment 2](#amendment-2-2026-11-28-leader-hand-over-the-probes-certificate-check-and-d7-on-plaintext) (proposed 2026-11-28)
+- **Status:** Accepted (2026-11-25, by the owner, with decisions D1 to D9 as recommended; see [Owner decisions](#owner-decisions-2026-11-25)); points 2 and 6 amended by [amendment 1](#amendment-1-2026-11-26-one-batch-in-flight-and-a-discarded-entrys-outcome-is-unknown) (accepted 2026-11-26); points 3, 4, 5, 9, and 11 amended by [amendment 2](#amendment-2-2026-11-28-leader-hand-over-the-probes-certificate-check-and-d7-on-plaintext) (proposed 2026-11-28); point 6 amended by [amendment 3](#amendment-3-2026-11-28-fork-actions-that-act-on-reports-dont-wait-out-the-settle-window) (proposed 2026-11-28)
 - **Date:** 2026-11-04 (revised on 2026-11-25 against `main` at 0.9.0, before acceptance)
 - **Related:** ADR-0035 (amends points 1, 3, 4, 5, 6, 7, 8, 9, 11, 12, 13, 14, and 15), ADR-0017, ADR-0018, ADR-0020, ADR-0022, ADR-0026, ADR-0031 (amendment 2), ADR-0034, ADR-0038, ADR-0039, ADR-0043, ADR-0046 (FR-110 amendment), ADR-0047, ADR-0050; tickets FR-064 (#67), FR-065 (#68), FR-127 (#216), FR-128 (#217)
 
@@ -230,6 +230,32 @@ Building PR 5 against openraft 0.10.1 showed that the hand-over of point 5 needs
    - The answer to a group change is the group as the node that made the change then knows it, read without a read round. A change that handed the leadership over is therefore never redirected and sent again.
 3. **The leader checks the certificate of a node it adds** (extends point 4). A `Probe` reply names its node only as that node says, so before it adds a node the leader makes one TLS handshake of its own to the address. It refuses the node unless the server's certificate names the node the operator asked for. On a plaintext fleet nothing names the server, and the check passes. The check pins the node's identity only when it is added. After that the `control peer` binding judges each call by the caller's certificate, and certificates that mark a node as a control node stay a later decision (ADR-0035 point 13).
 4. **D7 on a plaintext fleet** (qualifies point 9). `Leave` is refused when the request boundary resolved the caller as a principal, or when the request carries no boundary context at all (the refusal fails closed). An anonymous `Leave` on a plaintext fleet passes, because nothing tells a node's own leave from an operator's. Only `insecure_plaintext` and the simulation run so. The refusal is audited with the principal and its credential.
+
+## Amendment 3 (2026-11-28): fork actions that act on reports don't wait out the settle window
+
+- **Status:** Proposed (2026-11-28, with FR-064's PR 6; for the owner to accept). It records the owner's choice of option A on FR-118 (#186).
+- **Amends:** point 6's settle window, which gated every fork action. Promotions and kept-set releases stay gated as written.
+
+Point 6 gated "fork actions" with promotions and kept-set releases, because each "acts on liveness and on primaries' reports, which a new leader's state can show stale". For most fork actions that isn't so. Gating them all made every fork stand still for a lease duration plus the failover margin (12 s by default) after a control node started or a new leader took over: FR-094's friction F1, listed as a known limit in 0.8.0.
+
+1. **The fork driver withholds only the retries that rest on liveness or elapsed time while the leader settles.** `fleetring_control::fork::actions` takes the leader's place in its window as a typed argument, `Settle::Settling` or `Settle::Settled`, and stays pure. While settling, it withholds exactly two proposals:
+   - `RetryForkSeed` with `RetryCause::SeederDown`, which it proposes when the seeder left the fleet or the replica set, or its last heartbeat is older than the heartbeat timeout plus the fork's seeder timeout;
+   - `RetryForkSeed` with `RetryCause::AttemptTimedOut`, which it proposes when the attempt has run for the fork's attempt timeout.
+
+   A new leader's state time comes from its own clock while members' heartbeats are still on their way to it, so a live seeder can look down and an attempt overdue, for the same reason leases look expired. These wait out the window, as promotions do. `SeederDown` also covers a seeder that left; it is one cause, and it waits as a whole.
+2. **Everything else the driver proposes goes at once.** Each acts only on reports that carry the fork's identity, or on membership, and neither is stale on a new leader in a way that matters:
+   - `CompleteFork` needs a completion quorum of reports naming the fork's identity, its attempt, and the source's incarnation, at log epoch 0;
+   - `MarkForkReady` needs the bootstrap quorum's reset reports, naming the fork's identity and an epoch the database issued;
+   - `ReleaseForkHolders` needs the lease holder's report, at the lease's epoch and the current membership epoch;
+   - `RecordForkDiskRefusal` and `FailFork` on a reported permanent failure, and `RetryForkSeed` on a reported seed failure (`TransferFailed`, `PinExpired`) or a disk refusal (`SeederDiskRefused`), each act on a report about this fork;
+   - `FailFork` for a source dropped or recreated reads the source's record in control state;
+   - `DropForkHolder` acts on a holder's report that it lost its copy, or on a holder that is no longer a fleet member.
+
+   A report reaches control state only through a committed heartbeat, so a new leader holds every report the old one acted on, and a report that is old is still about the fork it names: `apply` checks the identity and the attempt again. Where a retry picks its next seeder, it picks among members that look live, so a stale view can only make it wait for one, never pick a member that looks down.
+3. **Deadlines are unchanged.** The driver's `Tick` for a fork past its deadline, or an operation past its retention, was gated with the rest; it now goes at once, as the leader's idle tick, which never waited for the window, already failed deadlines on a quiet control plane.
+4. **What stays gated.** Starting a promotion still waits out the window, since it acts on liveness and leases, which a new leader's state shows stale. Releasing a kept replica set waits too, by the owner's choice on FR-118, pending a follow-up: it has the shape of the now-ungated `ReleaseForkHolders`, a lease holder's report at the lease's epoch and the current membership epoch, with no liveness and no time, so the same argument would exempt it. Notices for promotions in progress go out at once, as before.
+
+`fleetring-control`'s `apply`, `State`, `Command`, and their serde forms don't change; only the driver's signature does. A replay of the control log doesn't run the driver, so replays are unaffected.
 
 ## Alternatives considered
 

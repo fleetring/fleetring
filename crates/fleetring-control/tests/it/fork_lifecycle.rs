@@ -391,7 +391,7 @@ fn a_ring_change_after_the_report_blocks_the_release_until_a_fresh_one() {
     let member = Member::new(id("n3")).with_software(current_software());
     run(&mut state, 46, Action::Join { member }).expect("join");
     assert_ne!(state.membership_epoch(), reported_at);
-    assert!(fork::actions(&state, at(47)).is_empty());
+    assert!(fork::actions(&state, at(47), fork::Settle::Settled).is_empty());
     let release = Action::ReleaseForkHolders {
         fork: fork.clone(),
         epoch: LeaseEpoch::new(1),
@@ -463,7 +463,7 @@ fn a_promotion_in_progress_blocks_the_release() {
         ),
     )
     .expect("hb");
-    assert!(fork::actions(&state, at(2_020)).is_empty());
+    assert!(fork::actions(&state, at(2_020), fork::Settle::Settled).is_empty());
     refused(
         &mut state,
         2_020,
@@ -634,7 +634,7 @@ fn a_promotion_after_readiness_fences_the_holders_until_they_are_released() {
         ),
     )
     .expect("hb");
-    assert!(fork::actions(&state, at(2_060)).is_empty());
+    assert!(fork::actions(&state, at(2_060), fork::Settle::Settled).is_empty());
     refused(
         &mut state,
         2_060,
@@ -810,7 +810,7 @@ fn a_lost_copy_after_the_first_lease_keeps_the_holder() {
     let fork = identity(&state, "t");
     first_lease(&mut state, 30, "n0").expect("lease");
     run(&mut state, 35, report_copy_lost("n1", &fork, 1)).expect("hb");
-    assert!(fork::actions(&state, at(40)).is_empty());
+    assert!(fork::actions(&state, at(40), fork::Settle::Settled).is_empty());
     refused(
         &mut state,
         40,
@@ -919,7 +919,7 @@ fn a_leased_fork_keeps_every_holder_that_leaves() {
         },
     )
     .expect("leave");
-    assert!(fork::actions(&state, at(50)).is_empty());
+    assert!(fork::actions(&state, at(50), fork::Settle::Settled).is_empty());
     refused(
         &mut state,
         51,
@@ -943,7 +943,7 @@ fn a_leased_fork_keeps_every_holder_that_leaves() {
         },
     )
     .expect("leave");
-    assert!(fork::actions(&state, at(61)).is_empty());
+    assert!(fork::actions(&state, at(61), fork::Settle::Settled).is_empty());
     refused(
         &mut state,
         62,
@@ -1080,7 +1080,7 @@ fn completion_and_readiness_need_a_majority_under_local_acks() {
         report_reset("n0", &fork, LeaseEpoch::new(1), &[3]),
     )
     .expect("hb");
-    assert!(fork::actions(&state, at(36)).is_empty());
+    assert!(fork::actions(&state, at(36), fork::Settle::Settled).is_empty());
     refused(
         &mut state,
         36,
@@ -1093,7 +1093,10 @@ fn completion_and_readiness_need_a_majority_under_local_acks() {
         report_reset("n1", &fork, LeaseEpoch::new(1), &[3]),
     )
     .expect("hb");
-    assert_eq!(fork::actions(&state, at(38)), vec![ready.clone()]);
+    assert_eq!(
+        fork::actions(&state, at(38), fork::Settle::Settled),
+        vec![ready.clone()]
+    );
     run(&mut state, 38, ready).expect("ready");
 }
 

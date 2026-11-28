@@ -250,7 +250,7 @@ pub(crate) fn with_intent(mut action: Action, edit: impl FnOnce(&mut ForkIntent)
 /// Applies every action the fork driver proposes at `millis`, and returns them with their
 /// outcomes.
 pub(crate) fn drive(state: &mut State, millis: u64) -> Vec<(Action, Outcome)> {
-    fork::actions(state, at(millis))
+    fork::actions(state, at(millis), fork::Settle::Settled)
         .into_iter()
         .map(|action| {
             let outcome = apply(state, Command::new(at(millis), action.clone()));

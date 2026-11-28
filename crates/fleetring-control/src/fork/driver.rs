@@ -43,23 +43,30 @@ use crate::{Action, Database, LeaseEpoch, Position, Report, State, Timestamp};
 /// and a [`Action::Tick`] when a seeding fork is past its deadline, which the tick fails, or an
 /// operation's record is past its retention, which the tick forgets.
 ///
+/// While `settle` is [`Settle::Settling`], the driver withholds the two proposals that rest on
+/// liveness or on elapsed time alone: an [`Action::RetryForkSeed`] with
+/// [`RetryCause::SeederDown`] or [`RetryCause::AttemptTimedOut`]. Every other proposal acts on
+/// reports that carry the fork's identity, or on membership, which a new leader's state shows as
+/// correctly as an old leader's (ADR-0040, amendment 3).
+///
 /// # Examples
 ///
 /// ```
 /// use fleetring_control::{fork, ControlConfig, State, Timestamp};
 ///
 /// let state = State::new(ControlConfig::new());
-/// assert!(fork::actions(&state, Timestamp::from_millis(0)).is_empty());
+/// let now = Timestamp::from_millis(0);
+/// assert!(fork::actions(&state, now, fork::Settle::Settled).is_empty());
 /// ```
 #[must_use]
-pub fn actions(state: &State, now: Timestamp) -> Vec<Action> {
+pub fn actions(state: &State, now: Timestamp, settle: Settle) -> Vec<Action> {
     let now = now.max(state.now());
     let mut actions: Vec<Action> = state
         .databases()
         .filter_map(|db| {
             let fork = db.fork()?;
             match fork.state() {
-                ForkState::Seeding { .. } => seeding(state, now, db, fork),
+                ForkState::Seeding { .. } => seeding(state, now, db, fork, settle),
                 ForkState::Seeded { .. } => seeded(state, db, fork),
                 ForkState::Ready {
                     holders: Some(_), ..
@@ -74,8 +81,28 @@ pub fn actions(state: &State, now: Timestamp) -> Vec<Action> {
     actions
 }
 
+/// Where the leader that runs the driver stands in its settle window: a lease duration plus the
+/// failover margin from the moment it became ready (ADR-0040, point 6).
+///
+/// A new leader's state can show a live member as down, and an attempt as overdue, for the same
+/// reason leases look expired after an election: no heartbeat has reached it yet. The driver
+/// withholds what rests on that view until the window has passed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Settle {
+    /// The leader became ready less than a settle window ago.
+    Settling,
+    /// The settle window has passed, or no window applies, as in a replay or a test.
+    Settled,
+}
+
 /// What moves a seeding fork on, if anything.
-fn seeding(state: &State, now: Timestamp, db: &Database, fork: &Fork) -> Option<Action> {
+fn seeding(
+    state: &State,
+    now: Timestamp,
+    db: &Database,
+    fork: &Fork,
+    settle: Settle,
+) -> Option<Action> {
     let ForkState::Seeding {
         attempt,
         seeder,
@@ -176,6 +203,12 @@ fn seeding(state: &State, now: Timestamp, db: &Database, fork: &Fork) -> Option<
         None
     };
     let (cause, exclude_seeder) = retry?;
+    // Liveness and elapsed time wait out a new leader's settle window; reports don't.
+    if settle == Settle::Settling
+        && matches!(cause, RetryCause::SeederDown | RetryCause::AttemptTimedOut)
+    {
+        return None;
+    }
     // Out of attempts, `apply` fails the fork whatever is live; otherwise the next attempt
     // needs a live seeder, and waits for one.
     let mut excluded = seeder_excluded.clone();

@@ -51,7 +51,7 @@ impl Log {
 
     /// Applies and logs everything the fork driver proposes at `millis`.
     fn drive(&mut self, millis: u64) -> Vec<Outcome> {
-        fork::actions(&self.state, at(millis))
+        fork::actions(&self.state, at(millis), fork::Settle::Settled)
             .into_iter()
             .map(|action| self.run(millis, action))
             .collect()
@@ -313,7 +313,9 @@ fn a_log_with_every_fork_command_and_refusal_replays_identically() {
     )
     .expect("fail");
     let forgotten = 81 + limits().operation_retention.get();
-    assert!(fork::actions(&log.state, at(forgotten)).contains(&Action::Tick));
+    assert!(
+        fork::actions(&log.state, at(forgotten), fork::Settle::Settled).contains(&Action::Tick)
+    );
     log.run(forgotten, Action::Tick).expect("tick");
     let left: Vec<OperationId> = log
         .state
@@ -618,7 +620,7 @@ fn step_action(state: &State, step: Step, clock: u64) -> Vec<Action> {
             };
             vec![heartbeat_of(node, vec![report], Some(1 << 40))]
         }
-        5 | 6 => fork::actions(state, at(clock)),
+        5 | 6 => fork::actions(state, at(clock), fork::Settle::Settled),
         7 => vec![Action::AcquireLease {
             database: db(name),
             node: id(node),

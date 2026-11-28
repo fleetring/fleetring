@@ -249,6 +249,7 @@ const _: () = {
     assert_debug_send_sync::<fork::ResetReport>();
     assert_debug_send_sync::<fork::RetryCause>();
     assert_debug_send_sync::<fork::SeedFailure>();
+    assert_debug_send_sync::<fork::Settle>();
     assert_debug_send_sync::<fork::SeedFailureReason>();
     assert_debug_send_sync::<fork::StagedCopy>();
     assert_debug_send_sync::<JoinKind>();

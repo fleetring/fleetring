@@ -155,8 +155,8 @@ fn a_seeder_out_of_disk_with_no_replacement_is_recorded_once() {
     assert!(
         matches!(fork_state(&state, "t"), ForkState::Seeding { attempt: 1, disk_refused, .. } if disk_refused.contains(&id(&order[0])))
     );
-    assert!(fork::actions(&state, at(4_001)).is_empty());
-    assert!(fork::actions(&state, at(4_500)).is_empty());
+    assert!(fork::actions(&state, at(4_001), fork::Settle::Settled).is_empty());
+    assert!(fork::actions(&state, at(4_500), fork::Settle::Settled).is_empty());
 
     run(&mut state, 5_000, heartbeat_of(&order[1], Vec::new(), None)).expect("hb");
     let proposed = drive(&mut state, 5_000);
@@ -184,8 +184,8 @@ fn the_driver_proposes_nothing_for_a_fork_in_an_empty_fleet() {
     for node in ["n0", "n1", "n2"] {
         run(&mut state, 30, Action::Leave { id: id(node) }).expect("leave");
     }
-    assert!(fork::actions(&state, at(40)).is_empty());
-    assert!(fork::actions(&state, at(10_000)).is_empty());
+    assert!(fork::actions(&state, at(40), fork::Settle::Settled).is_empty());
+    assert!(fork::actions(&state, at(10_000), fork::Settle::Settled).is_empty());
 }
 
 // ---- Stale copies in promotions ----
