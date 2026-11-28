@@ -28,7 +28,10 @@ pub(crate) const GROUPS: &[(&str, &[&str])] = &[
         ],
     ),
     ("Databases", &["db"]),
-    ("Fleet", &["status", "node", "orphan", "upgrade", "lease"]),
+    (
+        "Fleet",
+        &["status", "node", "control", "orphan", "upgrade", "lease"],
+    ),
     ("Security", &["cert", "token"]),
     ("Agents", &["mcp", "agent"]),
     ("Recovery", &["archive"]),

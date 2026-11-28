@@ -208,6 +208,83 @@ async fn a_stopped_daemon_frees_its_port_before_it_returns() -> TestResult {
     Ok(())
 }
 
+/// `fleetring control list` on a single control node (FR-064, ADR-0040 point 9): a group of one
+/// voter, which leads, in the table and in JSON.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn control_list_shows_a_single_control_node_as_its_voter_and_leader() -> TestResult {
+    let _children = CHILDREN.read().await;
+    let dir = tempfile::tempdir()?;
+    let tls = support::Tls::create(dir.path())?;
+    let text = format!(
+        "data_dir = {:?}\nlisten = \"127.0.0.1:0\"\nrole = \"control\"\n\n[node]\nid = \"control-1\"\n{}",
+        dir.path().join("data"),
+        tls.node_table("control-1")?
+    );
+    let daemon = fleetringd::Daemon::start(Config::from_toml(&text)?).await?;
+    let address = daemon.listen_address().to_string();
+    let list = |args: &'static [&'static str]| {
+        let tls_dir = tls.dir().to_owned();
+        let control = address.clone();
+        tokio::task::spawn_blocking(move || {
+            crate::support::fleetring()
+                .env("FLEETRING_TLS_DIR", tls_dir)
+                .args(["control", "list"])
+                .args(args)
+                .args(["--control", &control])
+                .output()
+        })
+    };
+    let output = list(&[]).await??;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let printed = String::from_utf8(output.stdout)?;
+    let rows: Vec<Vec<&str>> = printed
+        .lines()
+        .map(|line| line.split_whitespace().collect())
+        .collect();
+    assert_eq!(
+        rows.first().map(Vec::as_slice),
+        Some(&["NODE", "ADDRESS", "VOTER", "LEADER", "MATCHED", "VERSION"][..]),
+        "{printed}"
+    );
+    let row = rows.get(1).ok_or("no row")?;
+    assert_eq!(
+        row[..4],
+        ["control-1", address.as_str(), "yes", "yes"],
+        "{printed}"
+    );
+    assert!(row[4].parse::<u64>().is_ok(), "{printed}");
+    assert_eq!(
+        row[5],
+        fleetringd::software::release().to_string(),
+        "{printed}"
+    );
+    let last = printed.lines().last().ok_or("no lines")?;
+    assert!(
+        last.starts_with("term ") && last.contains(", committed index "),
+        "{printed}"
+    );
+    assert_eq!(rows.len(), 3, "{printed}");
+    let output = list(&["-o", "json"]).await??;
+    assert!(output.status.success());
+    let parsed: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    let nodes = parsed["nodes"].as_array().ok_or("no nodes")?;
+    assert_eq!(nodes.len(), 1, "{parsed}");
+    assert_eq!(nodes[0]["node"], "control-1");
+    assert_eq!(nodes[0]["voter"], true);
+    assert_eq!(nodes[0]["leader"], true);
+    assert!(
+        parsed["term"].as_u64().is_some_and(|term| term >= 1),
+        "{parsed}"
+    );
+    assert!(parsed["committed_index"].as_u64().is_some(), "{parsed}");
+    daemon.run_until(async {}).await;
+    Ok(())
+}
+
 /// `fleetring serve --check` (#95): whether a node would start with a configuration and its
 /// flags, without starting anything.
 mod check {

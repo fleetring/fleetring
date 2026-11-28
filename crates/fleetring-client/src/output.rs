@@ -175,6 +175,37 @@ pub struct NodeList {
     pub nodes: Vec<NodeReport>,
 }
 
+/// One voter or learner of the control group, as `control list` reports it (ADR-0040).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ControlNodeReport {
+    /// The node's ID.
+    pub node: String,
+    /// The address the group's members and data nodes dial, `host:port`.
+    pub address: String,
+    /// Whether it votes, rather than learns.
+    pub voter: bool,
+    /// Whether it leads the control group.
+    pub leader: bool,
+    /// The last log index the leader knows it holds.
+    pub matched_index: u64,
+    /// The release the leader last heard it report, or `null` before it has heard one.
+    pub release: Option<String>,
+}
+
+/// `control list`'s result: the control group as its leader knows it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ControlGroupReport {
+    /// Every voter and learner, in the leader's order.
+    pub nodes: Vec<ControlNodeReport>,
+    /// The control group's Raft term.
+    pub term: u64,
+    /// The index of the last entry the group has committed.
+    pub committed_index: u64,
+    /// Whether a change of voters began and hasn't finished; another `control set-voters`
+    /// finishes it.
+    pub joint: bool,
+}
+
 /// `status`'s result: the fleet as the control plane sees it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct FleetStatus {

@@ -1,0 +1,43 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH fleetring-control 1  FleetRing "FleetRing manual"
+.SH NAME
+fleetring\-control \- Adds, lists, and removes control nodes, and sets the voters
+.SH SYNOPSIS
+\fBfleetring control\fR [\fB\-\-log\-format\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-\-color\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIsubcommands\fR>
+.SH DESCRIPTION
+Adds, lists, and removes control nodes, and sets the voters
+.PP
+The control group is the control nodes that replicate the control log (ADR\-0040). Grow it from one control node to three with two `control add` and one `control set\-voters`; take a node out with `control set\-voters` without it, then `control remove`.
+.SH OPTIONS
+.TP
+\fB\-\-log\-format\fR \fI<LOG_FORMAT>\fR
+Writes log lines as `text` or `json`
+
+Overrides `FLEETRING_LOG_FORMAT` and the configuration file\*(Aqs `[log] format`.
+.TP
+\fB\-q\fR, \fB\-\-quiet\fR
+Prints the result and errors only
+
+No progress, notes, warnings or override warnings. A command with no result then prints nothing.
+.TP
+\fB\-\-color\fR \fI<COLOR>\fR
+When to colour log lines and the picker: auto, always, or never
+
+`auto`, the default, colours on a terminal unless `NO_COLOR` is set or `TERM` is `dumb`; `always` and `never` do as they say.
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help (see a summary with \*(Aq\-h\*(Aq)
+.SH SUBCOMMANDS
+.TP
+fleetring\-control\-add(1)
+Adds a control node to the control group as a learner
+.TP
+fleetring\-control\-set\-voters(1)
+Makes exactly these control nodes the voters
+.TP
+fleetring\-control\-remove(1)
+Removes a learner from the control group
+.TP
+fleetring\-control\-list(1)
+Lists the control group\*(Aqs voters and learners, and which one leads

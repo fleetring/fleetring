@@ -28,6 +28,7 @@ use fleetring_proto::v1::revocation::Revoked;
 use fleetring_proto::v1::{Revocation, RevokeTokenRequest};
 use fleetringd::auth::{BearerToken, DEFAULT_TOKEN_LIFETIME, MAX_TOKEN_LIFETIME, Scope, TokenSpec};
 use fleetringd::clock::{Clock as _, SystemClock};
+use fleetringd::control::GROUP_CHANGE_WAIT;
 use fleetringd::data::{
     ArchiveDescription, Client, DatabaseSpec, Expiry, LabelRequirement, LeaseUpdate, LeaseUpdates,
     ListFilter, Location, MetadataView, NewMetadata, Orphan, ReplicaInfo, Restoration,
@@ -46,9 +47,10 @@ use fleetringd::mcp::{self, Access, McpSettings};
 use fleetringd::observe::{LogColour, log_subscriber};
 use fleetringd::replication::ChainHash;
 use fleetringd::report::{
-    archive_report, database_location, database_report, expiry_text, fleet_status, lease_events,
-    liveness_name, metadata_report, node_list, node_list_text, node_status, orphan_report,
-    query_result, render_archived_metadata, render_text, schema_report, schema_unavailable, table,
+    archive_report, control_group, control_group_text, database_location, database_report,
+    expiry_text, fleet_status, lease_events, liveness_name, metadata_report, node_list,
+    node_list_text, node_status, orphan_report, query_result, render_archived_metadata,
+    render_text, schema_report, schema_unavailable, table,
 };
 use fleetringd::router::{Router, RouterConfig};
 use fleetringd::tls::{
@@ -133,11 +135,18 @@ struct Cli {
     /// nothing.
     #[arg(short, long, global = true)]
     quiet: bool,
-    /// When to colour log lines and the picker
+    /// When to colour log lines and the picker: auto, always, or never
     ///
-    /// `auto` colours on a terminal unless `NO_COLOR` is set or `TERM` is `dumb`; `always` and
-    /// `never` do as they say.
-    #[arg(long, global = true, value_enum, default_value_t = ColorChoice::Auto)]
+    /// `auto`, the default, colours on a terminal unless `NO_COLOR` is set or `TERM` is `dumb`;
+    /// `always` and `never` do as they say.
+    #[arg(
+        long,
+        global = true,
+        value_enum,
+        default_value_t = ColorChoice::Auto,
+        hide_possible_values = true,
+        hide_default_value = true
+    )]
     color: ColorChoice,
 }
 
@@ -277,6 +286,13 @@ enum Command {
     /// Lists, drains, undrains, and removes the fleet's members
     #[command(subcommand)]
     Node(NodeCommand),
+    /// Adds, lists, and removes control nodes, and sets the voters
+    ///
+    /// The control group is the control nodes that replicate the control log (ADR-0040). Grow it
+    /// from one control node to three with two `control add` and one `control set-voters`; take
+    /// a node out with `control set-voters` without it, then `control remove`.
+    #[command(subcommand)]
+    Control(ControlCommand),
     /// Follows the leases data nodes hold
     #[command(subcommand)]
     Lease(LeaseCommand),
@@ -1071,6 +1087,68 @@ enum NodeCommand {
     },
 }
 
+#[derive(Debug, Subcommand)]
+enum ControlCommand {
+    /// Adds a control node to the control group as a learner
+    ///
+    /// Start the node first with `role = "control"` (or `"both"`) and `[control] bootstrap =
+    /// "join"` on an empty data directory. The leader probes it, refuses one that holds Raft
+    /// state, runs a release outside the window, or names another node, and returns once it has
+    /// caught up with the log. A learner doesn't vote until `control set-voters` names it.
+    Add {
+        /// The node's ID, as its `[node] id` and certificate name it.
+        id: NodeId,
+        /// The address the group's members dial the node at, `host:port`
+        #[arg(long)]
+        address: String,
+        #[command(flatten)]
+        output: OutputArgs,
+        #[command(flatten)]
+        target: Target,
+    },
+    /// Makes exactly these control nodes the voters
+    ///
+    /// Each must be a member that has caught up; a voter left out stays a learner. The count must
+    /// be odd and at most seven: three or five in production. One voter has no redundancy, and
+    /// the command warns.
+    SetVoters {
+        /// A voter's node ID; repeat it for each voter
+        #[arg(long = "voter", value_name = "NODE", required = true)]
+        voters: Vec<NodeId>,
+        #[command(flatten)]
+        output: OutputArgs,
+        #[command(flatten)]
+        target: Target,
+    },
+    /// Removes a learner from the control group
+    ///
+    /// A voter leaves the voters first, with `control set-voters`. A removed node's Raft calls
+    /// are refused. Asks first on a terminal.
+    Remove {
+        /// The node's ID.
+        id: NodeId,
+        /// Removes without asking
+        ///
+        /// Without it, the command asks first on a terminal, and refuses elsewhere.
+        #[arg(long)]
+        yes: bool,
+        #[command(flatten)]
+        output: OutputArgs,
+        #[command(flatten)]
+        target: Target,
+    },
+    /// Lists the control group's voters and learners, and which one leads
+    ///
+    /// As the leader knows them: each member's address, whether it votes or leads, the last log
+    /// index it holds, and the release it last reported.
+    List {
+        #[command(flatten)]
+        output: OutputArgs,
+        #[command(flatten)]
+        target: Target,
+    },
+}
+
 /// What `db create` and `db restore` record about the new database besides its placement.
 #[derive(Debug, Clone, Args)]
 struct MetadataArgs {
@@ -1683,6 +1761,21 @@ impl Target {
         Ok(Client::new(
             first_reachable(&resolved.control),
             self.network_with(security)?,
+        ))
+    }
+
+    /// A client for the control group's changes, whose request deadline outlasts the longest
+    /// the leader waits within one ([`GROUP_CHANGE_WAIT`]): a change answered only after the
+    /// client gave up would still run to its end, and the client couldn't tell how it ended.
+    fn group_client(&self) -> Result<Client, Box<dyn Error>> {
+        let resolved = self.resolved()?;
+        if resolved.control.is_empty() {
+            return Err(NO_CONTROL.into());
+        }
+        let security = self.security()?;
+        Ok(Client::new(
+            first_reachable(&resolved.control),
+            self.network_with(security)?.outlasting(GROUP_CHANGE_WAIT),
         ))
     }
 }
@@ -2731,6 +2824,7 @@ async fn run_command(command: Command) -> Result<(), Box<dyn Error>> {
                 epoch.get()
             )
         }
+        Command::Control(command) => run_control(command).await?,
         Command::Node(NodeCommand::Undrain { id, target }) => {
             target.client()?.undrain_node(&id).await.map_err(failed)?;
             format!("{id} is no longer draining; it may take primaries again\n")
@@ -2879,6 +2973,72 @@ async fn watch_leases(
             other => other?,
         }
     }
+}
+
+/// What `control set-voters` warns when it leaves the group one voter.
+const ONE_VOTER: &str = "warning: a control group of one voter has no redundancy";
+
+/// Runs a `control` subcommand, and returns what it prints: the group afterwards.
+async fn run_control(command: ControlCommand) -> Result<String, Box<dyn Error>> {
+    let (group, output) = match command {
+        ControlCommand::List { output, target } => (
+            target.client()?.control_group().await.map_err(failed)?,
+            output,
+        ),
+        ControlCommand::Add {
+            id,
+            address,
+            output,
+            target,
+        } => {
+            let progress = Progress::start(
+                format!("adding {id} to the control group\u{2026}"),
+                &spinner_surroundings(output.format().machine()),
+            );
+            let group = target
+                .group_client()?
+                .add_control_node(&id, &address)
+                .await
+                .map_err(failed)?;
+            progress.finish_ok(format!("added {id} as a learner"));
+            (group, output)
+        }
+        ControlCommand::SetVoters {
+            voters,
+            output,
+            target,
+        } => {
+            if voters.len() == 1 {
+                note(ONE_VOTER);
+            }
+            let group = target
+                .group_client()?
+                .set_control_voters(&voters)
+                .await
+                .map_err(failed)?;
+            (group, output)
+        }
+        ControlCommand::Remove {
+            id,
+            yes,
+            output,
+            target,
+        } => {
+            if !yes {
+                confirm::confirm(&confirm::remove_control_node(id.as_str(), &target.place()?))?;
+            }
+            let group = target
+                .group_client()?
+                .remove_control_node(&id)
+                .await
+                .map_err(failed)?;
+            (group, output)
+        }
+    };
+    let report = control_group(&group);
+    format::render(output.format(), &report, |report| {
+        Ok(control_group_text(report))
+    })
 }
 
 /// Runs `upgrade` and returns what it prints. A check that finds a newer release the fleet
