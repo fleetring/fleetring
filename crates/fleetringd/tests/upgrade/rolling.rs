@@ -89,28 +89,31 @@ fn has_upgrade(bin: &Path) -> TestResult<bool> {
     )
 }
 
-/// The control group's voters in `control_db`'s newest control snapshot, as Raft IDs in hex.
-fn voters(control_db: &Path) -> TestResult<Vec<Vec<String>>> {
-    let connection = rusqlite::Connection::open_with_flags(
-        control_db,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-    )?;
-    let format: String =
-        connection.query_row("SELECT value FROM meta WHERE key = 'format'", [], |row| {
-            row.get(0)
-        })?;
-    assert_eq!(format, "2", "the control log migrated to format 2");
-    let membership: String = connection.query_row(
-        "SELECT membership FROM snapshots ORDER BY log_index DESC LIMIT 1",
-        [],
-        |row| row.get(0),
-    )?;
-    let membership: serde_json::Value = serde_json::from_str(&membership)?;
-    let configs = membership
-        .pointer("/membership/configs")
-        .or_else(|| membership.get("configs"))
-        .ok_or("a membership without configs")?;
-    Ok(serde_json::from_value(configs.clone())?)
+/// The control group's voters, by node ID, and whether its membership is joint, as `fleetring
+/// control list -o json`, run as `bin`, reports them from the leader.
+fn voters(fleet: &ProcessFleet, bin: &Path, path: &str) -> TestResult<(Vec<String>, bool)> {
+    let listed = fleet
+        .command(bin, path)
+        .args(["control", "list", "-o", "json", "--control", &fleet.control])
+        .output()?;
+    assert!(listed.status.success(), "{}", printed(&listed));
+    let group: serde_json::Value = serde_json::from_slice(&listed.stdout)?;
+    let nodes = group
+        .get("nodes")
+        .and_then(serde_json::Value::as_array)
+        .ok_or("a control group without nodes")?;
+    let voters = nodes
+        .iter()
+        .filter(|node| node.get("voter").and_then(serde_json::Value::as_bool) == Some(true))
+        .map(|node| {
+            node.get("node")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+                .ok_or("a control node without an ID")
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let joint = group.get("joint").and_then(serde_json::Value::as_bool) == Some(true);
+    Ok((voters, joint))
 }
 
 /// Every database the fleet lists, with its epoch and primary.
@@ -287,12 +290,22 @@ fn a_fleet_rolls_from_the_previous_release_to_this_build_under_writes() -> TestR
         progress(&format!("{id} runs {}", current()));
 
         if index == 0 {
-            // The format-1 log migrated to a control group whose only voter is the control node.
-            let control_db = fleet.nodes[0].data_dir.join("control.db");
-            let own = fleetringd::control::raft::raft_id_text(fleetringd::control::raft::raft_id(
-                id.as_str(),
-            ));
-            assert_eq!(voters(&control_db)?, vec![vec![own]]);
+            // The format-1 log migrated to format 2, a control group whose only voter is the
+            // control node, as `control list` reports it.
+            let control_db = rusqlite::Connection::open_with_flags(
+                fleet.nodes[0].data_dir.join("control.db"),
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )?;
+            let format: String =
+                control_db.query_row("SELECT value FROM meta WHERE key = 'format'", [], |row| {
+                    row.get(0)
+                })?;
+            drop(control_db);
+            assert_eq!(format, "2", "the control log migrated to format 2");
+            assert_eq!(
+                voters(&fleet, &this_build, &path)?,
+                (vec![id.to_string()], false)
+            );
             // Every database the fleet created is still listed at its epoch. The control node
             // also hosts data, so its upgrade drains it: a database it was primary for moves its
             // lease to another replica, at a later epoch. Every other keeps its epoch, since the
