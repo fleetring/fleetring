@@ -120,6 +120,11 @@ pub enum Invariant {
     ForkFrozenReplicaSet,
     /// No node admits more concurrent forks' copies than its free disk holds.
     ForkDiskAdmission,
+    /// Every control node's committed log holds the same command at every index two of them
+    /// both hold (ADR-0040 point 2).
+    ControlLogsAgree,
+    /// At most one control node leads each of the control group's terms.
+    OneLeaderPerTerm,
 }
 
 impl fmt::Display for Invariant {
@@ -155,6 +160,8 @@ impl fmt::Display for Invariant {
             Self::ForkResetOnce => "fork property (h): exactly one reset",
             Self::ForkFrozenReplicaSet => "fork property (i): frozen replica set and hand-over",
             Self::ForkDiskAdmission => "fork property: disk admission",
+            Self::ControlLogsAgree => "control logs agree",
+            Self::OneLeaderPerTerm => "one leader per term",
         })
     }
 }
@@ -360,6 +367,13 @@ pub struct ControlLog {
     entries: Vec<(u64, Command)>,
     commands: Vec<Command>,
     holders: LeaseHolders,
+    /// The index the replay started after: its snapshot's, or `None` from genesis.
+    from_index: Option<u64>,
+    /// The last committed index, if any entry is committed.
+    committed: Option<u64>,
+    /// Every committed entry the replay read, of every kind, as its index, its term, and its
+    /// leader's Raft ID.
+    log_ids: Vec<(u64, u64, u64)>,
 }
 
 impl ControlLog {
@@ -404,6 +418,19 @@ impl ControlLog {
     #[must_use]
     pub fn lease_holders(&self) -> &LeaseHolders {
         &self.holders
+    }
+
+    /// Returns whether the replay started from genesis, so that the checks that need every
+    /// command since then can run.
+    #[must_use]
+    pub fn from_genesis(&self) -> bool {
+        self.from_index.is_none()
+    }
+
+    /// Returns the last committed index the replay reached, if any entry is committed.
+    #[must_use]
+    pub fn committed(&self) -> Option<u64> {
+        self.committed
     }
 
     /// Returns the recovered state, consuming the record.
@@ -474,8 +501,14 @@ pub fn control_log_replays(path: &Path) -> Result<ControlLog, Violation> {
         Some(last) if last >= start => store.entries(start..=last).map_err(read)?,
         Some(_) | None => Vec::new(),
     };
+    let mut log_ids = Vec::new();
     for entry in logged {
         let index = entry.log_id.index;
+        log_ids.push((
+            index,
+            entry.log_id.leader_id.term,
+            entry.log_id.leader_id.node_id,
+        ));
         if let openraft::EntryPayload::Normal(request) = &entry.payload {
             match decide(&entry.log_id, request) {
                 Decision::Apply(command) => {
@@ -517,7 +550,152 @@ pub fn control_log_replays(path: &Path) -> Result<ControlLog, Violation> {
         entries,
         commands,
         holders,
+        from_index,
+        committed: last,
+        log_ids,
     })
+}
+
+/// Replays the control log of every control host in `logs`, each a host's name and its log's
+/// path, and checks that they agree ([`logs_agree`]). Returns each host's replay, in the order
+/// given. Call it only while no control node has its log open.
+///
+/// # Errors
+///
+/// [`Invariant::ControlLogReplays`] if a log doesn't replay, or [`Invariant::ControlLogsAgree`]
+/// naming the first index two logs disagree at.
+pub fn control_logs_agree<'a>(
+    logs: &[(&'a str, &Path)],
+) -> Result<Vec<(&'a str, ControlLog)>, Violation> {
+    let replayed = logs
+        .iter()
+        .map(|(host, path)| {
+            control_log_replays(path)
+                .map(|log| (*host, log))
+                .map_err(|violation| {
+                    Violation::new(
+                        violation.invariant(),
+                        format!("{host}: {}", violation.detail()),
+                    )
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    logs_agree(replayed.iter().map(|(host, log)| (*host, log)))?;
+    Ok(replayed)
+}
+
+/// Checks that every pair of replayed control logs holds the same applied command at every index
+/// both cover, from the later of their starts through the earlier of their committed ends, and
+/// skips the same superseded entries there: committed entries agree on every control node.
+///
+/// # Errors
+///
+/// [`Invariant::ControlLogsAgree`] naming the two hosts and the first index they disagree at.
+pub fn logs_agree<'a>(
+    logs: impl IntoIterator<Item = (&'a str, &'a ControlLog)>,
+) -> Result<(), Violation> {
+    let logs: Vec<(&str, &ControlLog)> = logs.into_iter().collect();
+    for (at, (first, ours)) in logs.iter().enumerate() {
+        for (second, theirs) in logs.iter().skip(at + 1) {
+            let start = ours.from_index.max(theirs.from_index);
+            let end = ours.committed.min(theirs.committed);
+            let Some(end) = end else { continue };
+            let covered = |index: u64| start.is_none_or(|start| index > start) && index <= end;
+            // Every entry both cover, blank and membership entries among them, has the same log
+            // ID: the same term and leader.
+            let ids = |log: &ControlLog| -> Vec<(u64, u64, u64)> {
+                log.log_ids
+                    .iter()
+                    .filter(|(index, _, _)| covered(*index))
+                    .copied()
+                    .collect()
+            };
+            let (our_ids, their_ids) = (ids(ours), ids(theirs));
+            if let Some((mine, other)) = our_ids
+                .iter()
+                .zip(&their_ids)
+                .find(|(mine, other)| mine != other)
+            {
+                return Err(Violation::new(
+                    Invariant::ControlLogsAgree,
+                    format!(
+                        "{first} holds an entry of term {} by {:016x} at {}, and {second} one of \
+                         term {} by {:016x} at {}",
+                        mine.1, mine.2, mine.0, other.1, other.2, other.0
+                    ),
+                ));
+            }
+            if our_ids.len() != their_ids.len() {
+                return Err(Violation::new(
+                    Invariant::ControlLogsAgree,
+                    format!(
+                        "{first} holds {} entries through {end} and {second} {}",
+                        our_ids.len(),
+                        their_ids.len()
+                    ),
+                ));
+            }
+            let ours_covered = ours.entries.iter().filter(|(index, _)| covered(*index));
+            let theirs_covered = theirs.entries.iter().filter(|(index, _)| covered(*index));
+            let mut pairs = ours_covered.zip(theirs_covered);
+            if let Some(((index, mine), (other, _))) = pairs.find(|(ours, theirs)| ours != theirs) {
+                let detail = if index == other {
+                    format!("{first} and {second} hold different commands at {index}: {mine:?}")
+                } else {
+                    format!(
+                        "{first} applies a command at {index} and {second} at {other}, which the \
+                         other skips"
+                    )
+                };
+                return Err(Violation::new(Invariant::ControlLogsAgree, detail));
+            }
+            let count = |log: &ControlLog| {
+                log.entries
+                    .iter()
+                    .filter(|(index, _)| covered(*index))
+                    .count()
+            };
+            if count(ours) != count(theirs) {
+                return Err(Violation::new(
+                    Invariant::ControlLogsAgree,
+                    format!(
+                        "{first} applies {} commands through {end} and {second} {}",
+                        count(ours),
+                        count(theirs)
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Checks that no two control hosts recorded leading the same term of the control group in
+/// `trace` ([`EventKind::Leader`](crate::sim::EventKind::Leader)).
+///
+/// # Errors
+///
+/// [`Invariant::OneLeaderPerTerm`] naming the term and both hosts.
+pub fn one_leader_per_term(trace: &crate::sim::Trace) -> Result<(), Violation> {
+    let mut leaders: BTreeMap<u64, &str> = BTreeMap::new();
+    for event in trace.events() {
+        let crate::sim::EventKind::Leader { term, leader } = event.kind() else {
+            continue;
+        };
+        match leaders.get(term) {
+            Some(known) if *known != leader.as_str() => {
+                return Err(Violation::new(
+                    Invariant::OneLeaderPerTerm,
+                    format!("{known} and {leader} both led term {term}"),
+                ));
+            }
+            Some(_) => {}
+            None => {
+                leaders.insert(*term, leader);
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Records every lease `state` holds now in `holders`. A lease's epoch names one holder for good,
@@ -1453,6 +1631,83 @@ mod tests {
             apply(&mut state, Command::new(at, action)).expect("accepted");
         }
         state
+    }
+
+    /// A replayed log holding `entries`, replayed from `from_index` through `committed`.
+    fn replayed(entries: &[(u64, u64)], from_index: Option<u64>, committed: u64) -> ControlLog {
+        let genesis = State::new(ControlConfig::new());
+        let entries: Vec<(u64, Command)> = entries
+            .iter()
+            .map(|(index, at)| {
+                let command = Command::new(Timestamp::from_millis(*at), Action::Tick);
+                (*index, command)
+            })
+            .collect();
+        ControlLog {
+            state: genesis.clone(),
+            genesis: genesis.clone(),
+            replayed_from: genesis,
+            commands: entries.iter().map(|(_, command)| command.clone()).collect(),
+            entries,
+            holders: LeaseHolders::new(),
+            from_index,
+            committed: Some(committed),
+            // Every index after the start, of term 1 under leader 1, applied or not.
+            log_ids: (from_index.map_or(0, |from| from + 1)..=committed)
+                .map(|index| (index, 1, 1))
+                .collect(),
+        }
+    }
+
+    /// Two logs agree when one is a prefix of the other, or they start at different snapshots;
+    /// they disagree when a shared index holds different commands, or one skips an entry the
+    /// other applies.
+    #[test]
+    fn logs_agree_on_what_both_cover() {
+        let leader = replayed(&[(1, 10), (2, 20), (3, 30), (5, 50)], None, 5);
+        let lagging = replayed(&[(1, 10), (2, 20)], None, 2);
+        let compacted = replayed(&[(3, 30), (5, 50)], Some(2), 5);
+        assert_eq!(
+            logs_agree([("c1", &leader), ("c2", &lagging), ("c3", &compacted)]),
+            Ok(())
+        );
+        let other = replayed(&[(1, 10), (2, 21)], None, 2);
+        let violation = logs_agree([("c1", &leader), ("c2", &other)]).expect_err("differs");
+        assert_eq!(violation.invariant(), Invariant::ControlLogsAgree);
+        assert!(violation.detail().contains("at 2"), "{violation}");
+        let skipped = replayed(&[(3, 30), (4, 40), (5, 50)], Some(2), 5);
+        let violation = logs_agree([("c1", &leader), ("c3", &skipped)]).expect_err("skips");
+        assert_eq!(violation.invariant(), Invariant::ControlLogsAgree);
+        // The same commands under another term at one index: another leader's entry.
+        let mut other_term = replayed(&[(1, 10), (2, 20)], None, 2);
+        other_term.log_ids[1].1 = 2;
+        let violation = logs_agree([("c1", &leader), ("c2", &other_term)]).expect_err("term");
+        assert!(violation.detail().contains("term 2"), "{violation}");
+    }
+
+    /// Two hosts leading one term is a violation; one host leading a term twice, as after a pause
+    /// in its readiness, isn't.
+    #[test]
+    fn one_leader_per_term_finds_a_second_leader() {
+        let leads = |at: u64, host: &str, term: u64| {
+            crate::sim::trace::Event::new(
+                Duration::from_millis(at),
+                host,
+                crate::sim::EventKind::Leader {
+                    term,
+                    leader: host.to_owned(),
+                },
+            )
+        };
+        let mut trace = crate::sim::Trace::default();
+        trace.push(leads(1, "c1", 1));
+        trace.push(leads(2, "c1", 1));
+        trace.push(leads(3, "c2", 2));
+        assert_eq!(one_leader_per_term(&trace), Ok(()));
+        trace.push(leads(4, "c3", 2));
+        let violation = one_leader_per_term(&trace).expect_err("two leaders");
+        assert_eq!(violation.invariant(), Invariant::OneLeaderPerTerm);
+        assert!(violation.detail().contains("term 2"), "{violation}");
     }
 
     #[test]
