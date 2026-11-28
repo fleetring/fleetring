@@ -916,3 +916,79 @@ The down-conversion (the old question 2) was dropped (D3). Leader transfer befor
   - **For PR 6's `SECURITY.md`.** A fresh joiner accepts any fleet node's Raft calls until it is added (the `control peer` binding's empty-membership case), and openraft adopts a higher vote it sees (`core/raft_core.rs` 2163-2166), so a fleet node that reaches a joiner first can poison its vote with a high term; the leader then steps up to it, costing an election, never safety. Any fleet node's certificate can also take a joiner's first `Probe`.
   - **Left as notes.** A peer's oversized gRPC message (`PayloadTooLarge` above 64 MiB) is a network error openraft retries; a snapshot chunk can't reach it. A reassembled snapshot at the same index as this node's committed entry but naming another entry would still make openraft panic (0.10.1's documented contract); only a forged or corrupt snapshot from a member does that.
   - **Left for PR 5/6.** The group RPCs and CLI, linearizable reads on the group, leader hand-over on shutdown, the daemon README's "Control group" section, router learning, updating a member's address in the membership when a control node restarts at another one (the membership keeps the address it was added with, which join and heartbeat replies then name), and the simulation's groups. Next: PR 5.
+- 2026-11-27: PR 5 written, in review: the control group's commands.
+  - **Protocol 1.4, still in no release,** gains `AddControlNode`, `SetControlVoters`, `RemoveControlNode`, and `DescribeControlGroup` on `Control`. They answer `ControlGroup { nodes, term, committed_index, leader, joint }`.
+  - **`Raft.TransferLeader`** is a fifth Raft call.
+  - **The CLI:** `fleetring control add|set-voters|remove|list` drive the new calls.
+  - **The leader answers every `Control` RPC.** The six reads of ADR-0040 point 2 are linearizable.
+  - **D7:** a principal's `node remove` of a group member is refused.
+  - **Hand-over:** a leader that stops gracefully hands its leadership over first.
+  - **Revised on 2026-11-28** after an independent review, which found one blocker and six should-fix items, all addressed below. The decisions beyond the accepted points are proposed as ADR-0040's amendment 2.
+  - **Choices the plan left open:**
+    - **Leader-only control.**
+      - Every `Control` handler starts with `ControlService::lead`, which reads the proposer's `Readiness` before it reads the request.
+      - A follower redirects to the leader it knows, or answers `UNAVAILABLE` while it knows none. A leader still catching up answers `UNAVAILABLE` without naming itself.
+      - The six linearizable reads (`Locate`, `ListDatabases`, opening `WatchMembership`, `DescribeControlGroup`, `GetForkOperation`, `ListDelegations`) first read and authorize the request. Then they call `ensure_linearizable(ReadPolicy::ReadIndex)`, so a request refused anyway costs no read round. They read the published state, which the state machine updates before openraft counts the entry applied.
+      - `ListTombstones` checks only that this node leads (ADR-0050 point 8).
+      - The writes keep the check `submit` already made. A write that loses leadership after `lead` passes is still refused by the proposer.
+    - **Ending a `WatchMembership`.** The stream ends once this node is no longer ready under the leader the watch opened under. Its last item is a redirect to the new leader (ADR-0035 point 6). A node that knows no leader yet, as just after it handed its leadership over, waits up to the longest election timeout for one, and only then ends with `UNAVAILABLE` alone.
+    - **Group changes run to their end.**
+      - Each change runs in a task of its own, so a caller that goes away can't drop it between openraft's two steps or before its audit line.
+      - The audit line (`changed the control group` or `refused a change of the control group`) names the principal, its credential, the change as validated, and the change's own outcome.
+      - The answer is the group as the answering node then knows it, from one reading of its Raft metrics, without a read round. A `SetControlVoters` that hands the leadership over is therefore answered by the node that made it, and is never redirected and sent again. The review found exactly that: the first version answered with a linearizable read, failed `NotLeader` after the hand-over, was audited "refused", and ran again on the new leader.
+      - `fleetring control add|set-voters|remove` send the change with a request deadline that outlasts the leader's waits (`GROUP_CHANGE_WAIT`, 100 s).
+    - **Statuses.** `GroupError` maps as follows:
+      - `Probe`, `Invalid`, and `Refused` are `FAILED_PRECONDITION`.
+      - `Joint`, `CatchingUp`, and `NotCommitted` are `ABORTED`: the leader's wait ended, and the change may still take effect.
+        - Not `DEADLINE_EXCEEDED`, which `ControlClient` reads as an address that hangs, so it moves off the leader that answered.
+        - Not `UNAVAILABLE`, which says to retry, and a retried add or removal is refused as already done.
+      - Off the leader the answer is a redirect, or `UNAVAILABLE`. `Stopped` is `UNAVAILABLE`.
+      - The service refuses an even voter count, a node named twice, or more than seven voters (ADR-0035 point 11) with `INVALID_ARGUMENT`, before it changes anything. `set_voters` refuses more than seven too (`MAX_VOTERS`), which PR 4 didn't.
+    - **The probe's node ID against the certificate** (left by PR 4).
+      - `add_node` makes one TLS handshake of its own to the address (`Network::server_peer`, `Security::server_peer`). It refuses a node whose certificate names another node, or a principal.
+      - Plaintext names nobody and passes, as the `Raft` service's binding does.
+      - The check pins the node's identity only at the moment it is added. Every later Raft call is judged by its caller's certificate against the membership. Certificates that mark a node as a control node (FR-067's follow-up, ADR-0035 point 13) would close the remaining window.
+    - **D7.**
+      - `Leave` is refused when the boundary resolved the caller as a principal. It is also refused when the request carries no boundary context, so it fails closed.
+      - A node's own `Leave` under its certificate passes. So does an anonymous one on a plaintext fleet (the simulation and `insecure_plaintext` only), where nothing tells a node's own leave from an operator's.
+      - The refusal is audited with the principal and its credential.
+    - **Leader hand-over needs a fifth `Raft` RPC.**
+      - openraft 0.10.1's `trigger().transfer_leader` reaches the target through `RaftNetworkV2::transfer_leader`, whose default answers `Unreachable`.
+      - So `Raft.TransferLeader` (node, `control peer`) carries FleetRing's `TransferLeaderWire` and `TransferLeaderReply`, with four new golden vectors. Only the leader whose vote the request carries may send it.
+      - **Choosing the target.** `ControlHandle::hand_over` chooses among the other voters this node heard from within one election timeout. It picks the highest matched index, with the lowest Raft ID among equals, and hands nothing over when none was heard.
+      - **Bounded.** It triggers the transfer and waits until another node leads, for at most the longest election timeout. One `tokio::time::timeout` bounds the whole hand-over.
+      - **When it runs.** The daemon calls `ControlNode::hand_over` once, before it stops its server, so the new leader's messages reach it. `ControlNode::shutdown` hands over only if that didn't run, never after the server has stopped.
+      - **Nothing acknowledged is lost.** The old leader takes no write while the transfer runs, because openraft forwards them. The target campaigns only once its log holds the old leader's.
+    - **A leader demoted by `set-voters`.** openraft 0.10.1 lets a leader that a membership change leaves as a learner keep leading. Only a leader removed from the membership altogether steps down (`core/step_down_watcher.rs`). `set_voters` therefore hands over when the new voters leave this node out.
+    - **The CLI.**
+      - The `control` noun prints the group after every subcommand, as a table (with a line when the membership is joint) or with `-o json`, through `fleetring_client::output::ControlGroupReport`.
+      - `control add` shows a spinner on a terminal, and none with `-o json`.
+    - **The help budget.**
+      - A new noun made `fleetring -h` 51 lines, past ADR-0043 point 7.5's limit of 50.
+      - So the `--color` line no longer wraps: its summary names the three values, and clap's `[default: auto] [possible values: …]` stay out of the help. The long help says `auto` is the default.
+      - Every man page changed with it.
+  - **Tests.**
+    - **`tests/control/group.rs`:**
+      - `a_follower_redirects_every_control_call_to_the_leader` calls every `Control` row of `auth::RPCS` on a follower with an empty request, through a codec of its own. It covers a watch opened on a follower too.
+      - `a_read_after_a_write_sees_it_after_a_leader_change` covers `GetForkOperation`, `Locate`, `ListDatabases`, and `ListDelegations`.
+      - `watch_membership_ends_when_its_node_stops_leading` requires the new leader's hint.
+      - `set_voters_that_drops_the_leader_answers_with_the_group` uses a client that follows no redirect.
+      - `add_and_remove_answer_with_the_group_after`.
+      - `a_cancelled_group_change_runs_to_its_end` adds a node through a slow proxy and cancels the call.
+      - `a_leader_left_out_of_the_voters_hands_over`.
+      - `a_leader_hands_over_to_a_voter_that_answers`, with a voter down.
+      - `a_leader_hands_over_before_it_stops`, with election timeouts of 2.5 s, so that a new leader within 2 s can only come from the hand-over.
+      - `group_calls_need_the_fleet_scope`, `node_remove_refuses_a_control_group_member`, `a_voters_own_leave_is_not_refused`, and `a_dev_node_refuses_a_non_loopback_control_node`.
+    - **`tests/control/raft_network.rs`:** `transfer_leader_is_the_leaders_alone` (a member speaking for another is refused; a member's own vote changes nothing).
+    - **`tests/control_group.rs`:** grows a fleet while writing, starts a daemon on the 0.9.0 fixture, and runs `control add`, `set-voters` (the one-voter warning), and `remove` (exit code 2 without a terminal, then `--yes`) as the binary.
+    - **`tests/daemon.rs`:** runs `control list` on a single node.
+    - **Unit tests:**
+      - status mapping and the voter count in `service/group.rs`;
+      - the certificate check in `tls/conn.rs`, which runs `server_peer`'s handshake over an in-memory duplex against node and client certificates from the test authority.
+  - **Left as is.** `tests/upgrade/rolling.rs` (nightly) still reads the voters from `control.db`. Switching it to `control list` needs a run against the 0.9.0 baseline, so it waits for the next nightly change.
+  - **Left for PR 6.**
+    - The daemon README's "Control group" section.
+    - The simulation's groups and invariants.
+    - Router learning: the router calls only `Locate`, whose reply names no group.
+    - Updating a member's address when a control node restarts at another one. The membership keeps the address it was added with. Re-adding a member with a new address would need `Probe` to admit a member's own Raft state, and openraft's `ChangeMembers::SetNodes`.
+  - Next: PR 6.
