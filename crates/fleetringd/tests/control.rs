@@ -363,8 +363,11 @@ async fn a_control_daemon_runs_the_lease_lifecycle_through_the_client() -> TestR
         "invalid replication factor 256: expected 1 to 255, or 0 for the fleet's default"
     );
 
-    let before = daemon.control().ok_or("no control handle")?.state();
+    // Read the state only after the daemon stops: until then the leader's failover timer can
+    // commit a `Tick` that advances `now`, and the restarted daemon would recover that tick.
+    let handle = daemon.control().ok_or("no control handle")?;
     daemon.run_until(async {}).await;
+    let before = handle.state();
     // The membership stream ends when the control node stops.
     assert!(
         updates
