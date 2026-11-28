@@ -17,7 +17,7 @@ use fleetring_control::fork::{
 use fleetring_control::{
     DatabaseName, Feature, HostedReplica, Incarnation, LeaseEpoch, Position, ReplicaRole, State,
 };
-use fleetringd::sim::{Ack, Fleet, Operation, Operator, seeds};
+use fleetringd::sim::{Ack, Fleet, Operation, Operator, Timings, seeds};
 
 use crate::{BINARY, TestResult};
 
@@ -210,4 +210,97 @@ fn scenario(seed: u64) -> TestResult {
 #[test]
 fn reports_fed_without_data_nodes_drive_a_fork_to_ready() {
     seeds::run(BINARY, &[85], scenario);
+}
+
+/// FR-118: a control node that has just restarted completes a fork its replicas report staged
+/// within a few ticks, not a settle window later. The window here is a 10 s lease plus a 2 s
+/// failover margin, as the daemon's defaults make it; the fork must be seeded within 3 s of the
+/// restart.
+fn a_fork_moves_on_right_after_a_restart(seed: u64) -> TestResult {
+    const WITHIN: Duration = Duration::from_secs(3);
+    let timings = Timings {
+        lease_duration: Duration::from_secs(10),
+        lease_renewal: Duration::from_secs(2),
+        failover_margin: Duration::from_secs(2),
+        ..Timings::default()
+    };
+    let mut fleet = Fleet::builder(seed)
+        .control(CONTROL)
+        .timings(timings)
+        .build()?;
+    let operator = Operator::new();
+    fleet.client("operator", operator.clone());
+    let nodes: Vec<NodeId> = NODES
+        .iter()
+        .map(|node| node.parse())
+        .collect::<Result<_, _>>()?;
+    for node in &nodes {
+        operator.push(Operation::JoinWith {
+            node: node.clone(),
+            features: vec![Feature::Fork],
+        });
+    }
+    let source: DatabaseName = "notes".parse()?;
+    let target: DatabaseName = "notes-exp".parse()?;
+    operator.push(Operation::CreateDatabase {
+        database: source.clone(),
+        replication_factor: 3,
+    });
+    let operation = OperationId::from_bytes([0x18; 16]);
+    operator.push(Operation::Fork {
+        source: source.clone(),
+        target: target.clone(),
+        operation,
+        replication_factor: 3,
+        expect_source_incarnation: None,
+    });
+    await_fork(&mut fleet, &target, "the fork seeding", |state| {
+        matches!(state, ForkState::Seeding { .. })
+    })?;
+    let state = fleet.control_state().ok_or("control is down")?;
+    let incarnation = |name: &DatabaseName| {
+        state
+            .database(name)
+            .map(|database| database.incarnation())
+            .ok_or_else(|| format!("no database {name}"))
+    };
+    let identity = ForkIdentity::new(target.clone(), incarnation(&target)?, operation);
+    let source_incarnation = incarnation(&source)?;
+
+    fleet.crash(CONTROL)?;
+    fleet.restart(CONTROL)?;
+    let restarted = fleet.elapsed();
+    fleet.run_until(LIMIT, "the control node ready again", |fleet| {
+        fleet.control_state().is_some()
+    })?;
+    for node in &nodes {
+        let replica = HostedReplica::new(target.clone(), ReplicaRole::Follower, Position::new([]))
+            .with_staged(StagedCopy::new(
+                identity.clone(),
+                1,
+                Position::new([0, 0, 0, 0x2A]),
+                ChainHash::new([9; 32]),
+                source_incarnation,
+            ));
+        operator.push(Operation::Report {
+            node: node.clone(),
+            replicas: vec![replica],
+            disk_free_bytes: Some(1 << 40),
+        });
+    }
+    await_fork(&mut fleet, &target, "the fork seeded", |state| {
+        matches!(state, ForkState::Seeded { .. })
+    })?;
+    let took = fleet.elapsed() - restarted;
+    assert!(
+        took < WITHIN,
+        "the fork was seeded {took:?} after the restart, not within {WITHIN:?}"
+    );
+    fleet.finish()?;
+    Ok(())
+}
+
+#[test]
+fn a_fork_moves_on_right_after_the_control_node_restarts() {
+    seeds::run(BINARY, &[118], a_fork_moves_on_right_after_a_restart);
 }

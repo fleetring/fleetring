@@ -836,12 +836,26 @@ fn await_new_primary(run: &mut Run, target: &DatabaseName, old: &str) -> Result<
     Ok(())
 }
 
-/// Waits until every other replica of `target` follows its primary `primary`, connected and
-/// reported.
+/// Waits until every other holder of the fork `target` follows its primary `primary`, connected
+/// and reported. The fork completes on a completion quorum of its replicas, so it may have fewer
+/// holders than replicas: the driver completes it as soon as the quorum reports, also while a
+/// new control leader settles (ADR-0040, amendment 3).
 fn await_followers(run: &mut Run, target: &DatabaseName, primary: &str) -> Result<()> {
-    let others = usize::try_from(REPLICAS)? - 1;
     run.fleet
         .run_until(LIMIT, "the fork's holders following its primary", |fleet| {
+            let holders = fleet.control_state().and_then(|state| {
+                match state.database(target)?.fork()?.state() {
+                    ForkState::Seeded { holders, .. }
+                    | ForkState::Ready {
+                        holders: Some(holders),
+                        ..
+                    } => Some(holders.len()),
+                    _ => None,
+                }
+            });
+            let Some(others) = holders.and_then(|holders| holders.checked_sub(1)) else {
+                return false;
+            };
             fleet
                 .replication(primary)
                 .and_then(|replication| replication.primary_status(target))

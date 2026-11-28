@@ -25,9 +25,10 @@
 //!    through `Replication.DropCopy` (ADR-0042). A command refused or rejected is skipped; only
 //!    a stopped control node ends the task. Expiry doesn't depend on
 //!    leases, so it waits for no settling.
-//! 5. **Forks.** After the settling below, on every tick it submits what the fork driver
-//!    proposes ([`fork::actions`]): completions, retries, failures, readiness, and a tick when
-//!    a fork's deadline or an operation's retention has passed (ADR-0046, point 3.11).
+//! 5. **Forks.** On every tick it submits what the fork driver proposes ([`fork::actions`]):
+//!    completions, retries, failures, readiness, and a tick when a fork's deadline or an
+//!    operation's retention has passed (ADR-0046, point 3.11). Only the retries that rest on
+//!    liveness or elapsed time wait for the settling below (ADR-0040, amendment 3).
 //! 6. **Kept replica sets.** After the forks, it releases every replica set a membership change
 //!    kept whose primary reports that placement's write quorum holds its log
 //!    ([`State::releases_due`]; ADR-0031, amendment 2).
@@ -40,7 +41,8 @@
 //! it under any other. Only a stopped control node or a storage failure ends them.
 //!
 //! A leader that has just become ready gives primaries one lease duration plus the failover
-//! margin to renew before it starts a promotion, a fork action, or a kept set's release: leases
+//! margin to renew before it starts a promotion, retries a fork's seeding because its seeder
+//! looks down or its attempt overdue, or releases a kept set: leases
 //! look expired after an election or an outage only because nobody could renew them, and the
 //! primaries kept serving meanwhile (ADR-0018, point 6). The window is measured on
 //! `tokio::time::Instant`, which is monotonic, so a step of the leader's wall clock can't shorten
@@ -396,7 +398,12 @@ async fn lead(
                 .saturating_add(config.failover_margin())
                 .get(),
         );
-        if started.elapsed() > window {
+        let settle = if started.elapsed() > window {
+            fork::Settle::Settled
+        } else {
+            fork::Settle::Settling
+        };
+        if settle == fork::Settle::Settled {
             for database in state.promotions_due(now) {
                 match handle
                     .submit_under(
@@ -423,10 +430,14 @@ async fn lead(
                     },
                 }
             }
-            match drive_forks(handle, leader, now).await {
-                Sweep::Continue => {}
-                next @ (Sweep::Pause | Sweep::Stop) => return next,
-            }
+        }
+        // Report-driven fork actions go at once; the driver withholds the retries that rest on
+        // liveness or elapsed time while settling (ADR-0040, amendment 3).
+        match drive_forks(handle, leader, now, settle).await {
+            Sweep::Continue => {}
+            next @ (Sweep::Pause | Sweep::Stop) => return next,
+        }
+        if settle == fork::Settle::Settled {
             match release_kept_replicas(handle, leader).await {
                 Sweep::Continue => {}
                 next @ (Sweep::Pause | Sweep::Stop) => return next,
@@ -445,10 +456,17 @@ async fn lead(
 /// Submits what the fork driver proposes at `now` ([`fork::actions`]), one command at a time,
 /// and logs what became of each (ADR-0046, point 3.11). The driver reads only the state, so a
 /// restarted control node proposes the same commands; `apply` checks each one again, so a
-/// proposal made stale by an earlier one is refused and changes nothing. Says whether the timer
-/// goes on: it stops with the control node, and pauses when this node no longer leads.
-async fn drive_forks(handle: &ControlHandle, leader: LeaderRef, now: Timestamp) -> Sweep {
-    for action in fork::actions(&handle.state(), now) {
+/// proposal made stale by an earlier one is refused and changes nothing. While `settle` is
+/// [`fork::Settle::Settling`], the driver withholds the retries that rest on liveness or elapsed
+/// time. Says whether the timer goes on: it stops with the control node, and pauses when this
+/// node no longer leads.
+async fn drive_forks(
+    handle: &ControlHandle,
+    leader: LeaderRef,
+    now: Timestamp,
+    settle: fork::Settle,
+) -> Sweep {
+    for action in fork::actions(&handle.state(), now, settle) {
         match handle.submit_under(leader, action).await {
             Ok(committed) => match committed.outcome() {
                 Ok(applied) => tracing::info!(?applied, "a fork moved on"),
@@ -978,14 +996,15 @@ mod tests {
         node.shutdown().await;
     }
 
-    /// A leader that has just become ready moves no fork and releases no kept replica set for a
-    /// settle window, and does once it has passed (ADR-0040 point 6).
+    /// A leader that has just become ready completes a fork its replicas report staged at once,
+    /// well inside the settle window, but releases no kept replica set until the window has
+    /// passed (ADR-0040 point 6, amendment 3; FR-118).
     #[tokio::test(start_paused = true)]
-    async fn a_new_leader_waits_a_lease_duration_before_fork_actions_and_releases() {
+    async fn a_new_leader_completes_a_reported_fork_at_once_and_waits_to_release() {
         // The fork is seeded on every replica: the driver would complete it.
         let dir = tempfile::tempdir().expect("a directory");
         let clock = SteppedClock::new(fixture()[0].at);
-        let (node, heartbeats) = fixture_node(dir.path(), clock.clone(), 27).await;
+        let (node, _) = fixture_node(dir.path(), clock.clone(), 27).await;
         let handle = node.handle();
         let seeding = |handle: &ControlHandle| {
             handle.state().databases().any(|database| {
@@ -998,17 +1017,27 @@ mod tests {
             })
         };
         assert!(seeding(&handle));
-        assert!(!fork::actions(&handle.state(), clock.now()).is_empty());
+        let proposed = fork::actions(&handle.state(), clock.now(), fork::Settle::Settling);
+        assert!(
+            proposed
+                .iter()
+                .any(|action| matches!(action, Action::CompleteFork { .. })),
+            "a completion is proposed while settling: {proposed:?}"
+        );
+        let started = tokio::time::Instant::now();
         let timer = Failover::start(
             handle.clone(),
             Arc::new(clock.clone()),
             Network::tcp(crate::transport::TransportConfig::default()),
             FailoverSettings::new(),
         );
-        heartbeat_for(&handle, &heartbeats, WINDOW - Duration::from_secs(1)).await;
-        assert!(seeding(&handle), "no fork action inside the window");
-        heartbeat_for(&handle, &heartbeats, Duration::from_secs(3)).await;
-        assert!(!seeding(&handle), "the fork moved on after the window");
+        while seeding(&handle) {
+            assert!(
+                started.elapsed() < Duration::from_secs(1),
+                "the fork still seeds a second after readiness"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
         timer.stop().await;
         node.shutdown().await;
 
@@ -1033,6 +1062,78 @@ mod tests {
         assert!(
             handle.state().releases_due().is_empty(),
             "the kept set was released after the window"
+        );
+        timer.stop().await;
+        node.shutdown().await;
+    }
+
+    /// The fork in the 0.9.0 fixture's state while it seeds: its attempt and its seeder.
+    fn seeding_attempt(handle: &ControlHandle) -> Option<(u32, fleetring::NodeId)> {
+        handle
+            .state()
+            .databases()
+            .find_map(|database| match database.fork()?.state() {
+                fleetring_control::fork::ForkState::Seeding {
+                    attempt, seeder, ..
+                } => Some((*attempt, seeder.clone())),
+                _ => None,
+            })
+    }
+
+    /// A new leader doesn't retry a fork's seeding for a seeder that looks down until its settle
+    /// window has passed, and then does (ADR-0040 amendment 3; FR-118): the seeder looks down
+    /// only because the leader's state time ran on without its heartbeats, as after an election.
+    #[tokio::test(start_paused = true)]
+    async fn a_new_leader_waits_out_the_window_before_retrying_a_seeder_that_looks_down() {
+        let dir = tempfile::tempdir().expect("a directory");
+        let clock = SteppedClock::new(fixture()[0].at);
+        // The fork has just been requested; nobody has staged it.
+        let (node, heartbeats) = fixture_node(dir.path(), clock.clone(), 24).await;
+        let handle = node.handle();
+        let (attempt, seeder) = seeding_attempt(&handle).expect("the fork seeds");
+        assert_eq!(attempt, 1);
+        let others: Vec<Action> = heartbeats
+            .into_iter()
+            .filter(|beat| !matches!(beat, Action::Heartbeat { id, .. } if *id == seeder))
+            .collect();
+        // Every member but the seeder stays live until the driver would retry for the seeder.
+        let retry_due = |handle: &ControlHandle| {
+            fork::actions(&handle.state(), clock.now(), fork::Settle::Settled)
+                .iter()
+                .any(|action| {
+                    matches!(
+                        action,
+                        Action::RetryForkSeed {
+                            cause: fleetring_control::fork::RetryCause::SeederDown,
+                            ..
+                        }
+                    )
+                })
+        };
+        while !retry_due(&handle) {
+            heartbeat_for(&handle, &others, Duration::from_secs(1)).await;
+        }
+        assert!(
+            fork::actions(&handle.state(), clock.now(), fork::Settle::Settling).is_empty(),
+            "the retry is withheld while settling"
+        );
+        let timer = Failover::start(
+            handle.clone(),
+            Arc::new(clock.clone()),
+            Network::tcp(crate::transport::TransportConfig::default()),
+            FailoverSettings::new(),
+        );
+        heartbeat_for(&handle, &others, WINDOW - Duration::from_secs(1)).await;
+        assert_eq!(
+            seeding_attempt(&handle).map(|(attempt, _)| attempt),
+            Some(1),
+            "no retry inside the window"
+        );
+        heartbeat_for(&handle, &others, Duration::from_secs(3)).await;
+        assert_eq!(
+            seeding_attempt(&handle).map(|(attempt, _)| attempt),
+            Some(2),
+            "the seeder was passed over after the window"
         );
         timer.stop().await;
         node.shutdown().await;

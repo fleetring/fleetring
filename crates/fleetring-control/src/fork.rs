@@ -34,7 +34,7 @@ mod record;
 mod report;
 pub(crate) mod rules;
 
-pub use driver::actions;
+pub use driver::{Settle, actions};
 pub use identity::{ChainHash, ForkIdentity, OperationId, ParseOperationIdError};
 pub use operation::{
     CancelCause, ForkExpiry, ForkIntent, IntentField, MAX_FORK_OPERATIONS, OperationOutcome,

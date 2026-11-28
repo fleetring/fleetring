@@ -318,10 +318,10 @@ fn a_dropped_forks_identity_never_touches_its_replacement() {
     }
     // The driver counts none of the old identity's reports.
     assert_eq!(
-        fork::actions(&attacked, at(70)),
-        fork::actions(&clean, at(70))
+        fork::actions(&attacked, at(70), fork::Settle::Settled),
+        fork::actions(&clean, at(70), fork::Settle::Settled)
     );
-    assert!(fork::actions(&attacked, at(70)).is_empty());
+    assert!(fork::actions(&attacked, at(70), fork::Settle::Settled).is_empty());
 
     // The new fork then completes the same way in both runs.
     for state in [&mut attacked, &mut clean] {
@@ -934,7 +934,7 @@ fn an_operation_is_known_for_exactly_its_retention_after_its_outcome() {
     );
     assert!(state.database(&db("t")).is_none());
     assert_eq!(
-        fork::actions(&state, at(forgotten - 1)),
+        fork::actions(&state, at(forgotten - 1), fork::Settle::Settled),
         Vec::<Action>::new()
     );
 
@@ -945,7 +945,10 @@ fn an_operation_is_known_for_exactly_its_retention_after_its_outcome() {
             .fork_resend(&fork_request(1, "t"), at(forgotten))
             .is_none()
     );
-    assert_eq!(fork::actions(&state, at(forgotten)), vec![Action::Tick]);
+    assert_eq!(
+        fork::actions(&state, at(forgotten), fork::Settle::Settled),
+        vec![Action::Tick]
+    );
     live(&mut state, forgotten);
     run(&mut state, forgotten, Action::Tick).expect("tick");
     assert_eq!(state.fork_operations().len(), 0);
@@ -978,7 +981,7 @@ fn races_and_duplicates_are_refused() {
     for node in ["n0", "n1", "n2"] {
         run(&mut state, 20, report_staged(node, &fork, 1)).expect("heartbeat");
     }
-    let proposed = fork::actions(&state, at(20));
+    let proposed = fork::actions(&state, at(20), fork::Settle::Settled);
     run(&mut state, 25, Action::DropDatabase { name: db("t") }).expect("drop");
     for action in proposed {
         refused(&mut state, 30, action, &stale(&fork));
@@ -1093,10 +1096,15 @@ fn a_tick_fails_a_fork_at_its_deadline() {
     let mut state = fleet(&["n0", "n1", "n2"]);
     run(&mut state, 10, fork_request(1, "t")).expect("fork");
     let deadline = 10 + limits().deadline.get();
-    assert!(!fork::actions(&state, at(deadline - 1)).contains(&Action::Tick));
+    assert!(
+        !fork::actions(&state, at(deadline - 1), fork::Settle::Settled).contains(&Action::Tick)
+    );
     run(&mut state, deadline - 1, Action::Tick).expect("tick");
     assert_eq!(attempt(&state, "t"), 1);
-    assert_eq!(fork::actions(&state, at(deadline)), vec![Action::Tick]);
+    assert_eq!(
+        fork::actions(&state, at(deadline), fork::Settle::Settled),
+        vec![Action::Tick]
+    );
     run(&mut state, deadline, Action::Tick).expect("tick");
     assert!(matches!(
         fork_state(&state, "t"),
@@ -1222,7 +1230,7 @@ fn one_replica_out_of_disk_is_excluded_and_the_others_complete() {
         )]
     );
     assert_eq!(attempt(&state, "t"), 1);
-    assert!(fork::actions(&state, at(20)).is_empty());
+    assert!(fork::actions(&state, at(20), fork::Settle::Settled).is_empty());
     for node in [&order[0], &order[2]] {
         run(&mut state, 30, report_staged(node, &fork, 1)).expect("heartbeat");
     }
@@ -1392,8 +1400,8 @@ fn the_driver_retries_after_the_seeder_or_the_attempt_times_out() {
     };
     // The seeder's last heartbeat was at 0: down after 3 s, retried 5 s later.
     keep_live(&mut state, 7_000, &first);
-    assert!(fork::actions(&state, at(7_999)).is_empty());
-    let proposed = fork::actions(&state, at(8_000));
+    assert!(fork::actions(&state, at(7_999), fork::Settle::Settled).is_empty());
+    let proposed = fork::actions(&state, at(8_000), fork::Settle::Settled);
     assert_eq!(
         proposed,
         vec![Action::RetryForkSeed {
@@ -1412,8 +1420,11 @@ fn the_driver_retries_after_the_seeder_or_the_attempt_times_out() {
     for millis in (10_000..28_000).step_by(2_000) {
         keep_live(&mut state, millis, "");
     }
-    assert_eq!(fork::actions(&state, at(27_999)), Vec::<Action>::new());
-    let proposed = fork::actions(&state, at(28_000));
+    assert_eq!(
+        fork::actions(&state, at(27_999), fork::Settle::Settled),
+        Vec::<Action>::new()
+    );
+    let proposed = fork::actions(&state, at(28_000), fork::Settle::Settled);
     assert_eq!(
         proposed,
         vec![Action::RetryForkSeed {
@@ -1440,7 +1451,7 @@ fn the_driver_reacts_to_seed_failures_and_to_the_source() {
         report_failure(&first, &fork, 7, SeedFailureReason::TransferFailed),
     )
     .expect("hb");
-    assert!(fork::actions(&stale_attempt, at(20)).is_empty());
+    assert!(fork::actions(&stale_attempt, at(20), fork::Settle::Settled).is_empty());
 
     let mut retryable = state.clone();
     run(
@@ -1452,7 +1463,7 @@ fn the_driver_reacts_to_seed_failures_and_to_the_source() {
     // A seeder whose transfer failed is passed over, so a persistent cause doesn't spend every
     // attempt on one node.
     assert_eq!(
-        fork::actions(&retryable, at(20)),
+        fork::actions(&retryable, at(20), fork::Settle::Settled),
         vec![Action::RetryForkSeed {
             fork: fork.clone(),
             attempt: 1,
@@ -1506,19 +1517,19 @@ fn the_driver_reacts_to_seed_failures_and_to_the_source() {
         reason,
     };
     assert_eq!(
-        fork::actions(&permanent, at(20)),
+        fork::actions(&permanent, at(20), fork::Settle::Settled),
         vec![fail(ForkFailure::SourceTooLarge)]
     );
 
     let mut gone = state.clone();
     run(&mut gone, 20, Action::DropDatabase { name: db(SOURCE) }).expect("drop");
     assert_eq!(
-        fork::actions(&gone, at(20)),
+        fork::actions(&gone, at(20), fork::Settle::Settled),
         vec![fail(ForkFailure::SourceGone)]
     );
     run(&mut gone, 20, create_at(SOURCE, 3, 0x5A)).expect("recreate");
     assert_eq!(
-        fork::actions(&gone, at(20)),
+        fork::actions(&gone, at(20), fork::Settle::Settled),
         vec![fail(ForkFailure::SourceRecreated)]
     );
     let proposed = drive(&mut gone, 20);
@@ -1529,6 +1540,98 @@ fn the_driver_reacts_to_seed_failures_and_to_the_source() {
             reason: ForkFailure::SourceRecreated,
             ..
         }
+    ));
+}
+
+/// While a new leader settles, the driver withholds the retries that rest on liveness or on
+/// elapsed time alone, and proposes everything that acts on reports carrying the fork's identity
+/// or on membership, as it would once settled (ADR-0040, amendment 3; FR-118).
+#[test]
+fn while_settling_the_driver_withholds_only_the_liveness_and_time_retries() {
+    use fork::Settle::{Settled, Settling};
+    let mut state = fleet(&["n0", "n1", "n2"]);
+    run(&mut state, 10, fork_request(1, "t")).expect("fork");
+    let fork = identity(&state, "t");
+    let first = seeder(&state, "t");
+    let unchanged = |state: &State, millis: u64| {
+        let settling = fork::actions(state, at(millis), Settling);
+        assert!(!settling.is_empty(), "nothing proposed at {millis}");
+        assert_eq!(settling, fork::actions(state, at(millis), Settled));
+        settling
+    };
+
+    // Reports: a completion quorum's staged copies, the seeder's failure, a permanent failure.
+    let mut staged = state.clone();
+    for node in ["n0", "n1", "n2"] {
+        run(&mut staged, 20, report_staged(node, &fork, 1)).expect("heartbeat");
+    }
+    assert!(matches!(
+        unchanged(&staged, 20).as_slice(),
+        [Action::CompleteFork { .. }]
+    ));
+    let mut retryable = state.clone();
+    let failure = report_failure(&first, &fork, 1, SeedFailureReason::TransferFailed);
+    run(&mut retryable, 20, failure).expect("hb");
+    assert!(matches!(
+        unchanged(&retryable, 20).as_slice(),
+        [Action::RetryForkSeed {
+            cause: RetryCause::TransferFailed,
+            ..
+        }]
+    ));
+    let mut permanent = state.clone();
+    let failure = report_failure(&first, &fork, 1, SeedFailureReason::SourceTooLarge);
+    run(&mut permanent, 20, failure).expect("hb");
+    assert!(matches!(
+        unchanged(&permanent, 20).as_slice(),
+        [Action::FailFork {
+            reason: ForkFailure::SourceTooLarge,
+            ..
+        }]
+    ));
+    // Membership: the source is gone.
+    let mut gone = state.clone();
+    run(&mut gone, 20, Action::DropDatabase { name: db(SOURCE) }).expect("drop");
+    assert!(matches!(
+        unchanged(&gone, 20).as_slice(),
+        [Action::FailFork {
+            reason: ForkFailure::SourceGone,
+            ..
+        }]
+    ));
+
+    // Liveness: the seeder looks down for the seeder timeout.
+    let keep_live = |state: &mut State, millis: u64, except: &str| {
+        for node in ["n0", "n1", "n2"]
+            .into_iter()
+            .filter(|node| *node != except)
+        {
+            run(state, millis, heartbeat_of(node, Vec::new(), None)).expect("hb");
+        }
+    };
+    let mut down = state.clone();
+    keep_live(&mut down, 7_000, &first);
+    assert!(fork::actions(&down, at(8_000), Settling).is_empty());
+    assert!(matches!(
+        fork::actions(&down, at(8_000), Settled).as_slice(),
+        [Action::RetryForkSeed {
+            cause: RetryCause::SeederDown,
+            ..
+        }]
+    ));
+
+    // Elapsed time: every replica stays live, and the attempt runs out after 20 s.
+    let mut overdue = state.clone();
+    for millis in (2_000..28_000).step_by(2_000) {
+        keep_live(&mut overdue, millis, "");
+    }
+    assert!(fork::actions(&overdue, at(28_000), Settling).is_empty());
+    assert!(matches!(
+        fork::actions(&overdue, at(28_000), Settled).as_slice(),
+        [Action::RetryForkSeed {
+            cause: RetryCause::AttemptTimedOut,
+            ..
+        }]
     ));
 }
 
@@ -1543,8 +1646,8 @@ fn the_driver_takes_a_fork_from_request_to_ready() {
         run(&mut state, 20, report_staged(node, &fork, 1)).expect("heartbeat");
     }
     assert_eq!(
-        fork::actions(&state, at(20)),
-        fork::actions(&state.clone(), at(20))
+        fork::actions(&state, at(20), fork::Settle::Settled),
+        fork::actions(&state.clone(), at(20), fork::Settle::Settled)
     );
     let proposed = drive(&mut state, 20);
     assert!(
@@ -1553,7 +1656,7 @@ fn the_driver_takes_a_fork_from_request_to_ready() {
     );
     first_lease(&mut state, 30, "n1").expect("lease");
     // Nothing to do until the primary reports the reset.
-    assert!(fork::actions(&state, at(40)).is_empty());
+    assert!(fork::actions(&state, at(40), fork::Settle::Settled).is_empty());
     run(
         &mut state,
         40,
@@ -1561,7 +1664,7 @@ fn the_driver_takes_a_fork_from_request_to_ready() {
     )
     .expect("hb");
     // One of three isn't a majority.
-    assert!(fork::actions(&state, at(45)).is_empty());
+    assert!(fork::actions(&state, at(45), fork::Settle::Settled).is_empty());
     run(
         &mut state,
         45,
@@ -1584,5 +1687,5 @@ fn the_driver_takes_a_fork_from_request_to_ready() {
             })
         )]
     );
-    assert!(fork::actions(&state, at(60)).is_empty());
+    assert!(fork::actions(&state, at(60), fork::Settle::Settled).is_empty());
 }
