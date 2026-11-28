@@ -32,7 +32,9 @@ use v1::ProtocolVersion;
 /// `replicas_caught_up` in heartbeats, for membership changes that hand replica sets over on
 /// joint quorums (ADR-0031, amendment 2); and `ReplicateOpen.epoch_start_chain` (FR-044).
 /// Minor 4 adds the control group (ADR-0040 point 11): the `Raft` service with `Probe`,
-/// `RaftPayload`, `ControlNode`, and `control_nodes` in `JoinResponse` and `HeartbeatResponse`.
+/// `RaftPayload`, `ControlNode`, `control_nodes` in `JoinResponse` and `HeartbeatResponse`, and
+/// the group's calls `AddControlNode`, `SetControlVoters`, `RemoveControlNode`, and
+/// `DescribeControlGroup`, with `ControlGroup`.
 /// Peers need only share the major version (`check_protocol`), so these changed no version.
 pub const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion { major: 1, minor: 4 };
 

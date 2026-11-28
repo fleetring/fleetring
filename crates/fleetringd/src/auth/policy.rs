@@ -300,6 +300,28 @@ pub const RPCS: &[Rpc] = &[
         Requirement::Fleet,
         Binding::None,
     ),
+    // The control group (ADR-0035 point 11, ADR-0040): an operator's calls, never a node's, so a
+    // stolen node key can't add itself to the group or change its voters.
+    rpc(
+        "/fleetring.v1.Control/AddControlNode",
+        Requirement::Fleet,
+        Binding::None,
+    ),
+    rpc(
+        "/fleetring.v1.Control/SetControlVoters",
+        Requirement::Fleet,
+        Binding::None,
+    ),
+    rpc(
+        "/fleetring.v1.Control/RemoveControlNode",
+        Requirement::Fleet,
+        Binding::None,
+    ),
+    rpc(
+        "/fleetring.v1.Control/DescribeControlGroup",
+        Requirement::Fleet,
+        Binding::None,
+    ),
     // Replication: nodes only.
     rpc(
         "/fleetring.v1.Replication/Replicate",

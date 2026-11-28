@@ -225,6 +225,34 @@ impl Control for StubControl {
     ) -> Result<Response<fleetring_proto::v1::ListDelegationsResponse>, Status> {
         Err(Status::unimplemented("stub"))
     }
+
+    async fn add_control_node(
+        &self,
+        _: Request<fleetring_proto::v1::AddControlNodeRequest>,
+    ) -> Result<Response<fleetring_proto::v1::ControlGroup>, Status> {
+        Err(Status::unimplemented("stub"))
+    }
+
+    async fn set_control_voters(
+        &self,
+        _: Request<fleetring_proto::v1::SetControlVotersRequest>,
+    ) -> Result<Response<fleetring_proto::v1::ControlGroup>, Status> {
+        Err(Status::unimplemented("stub"))
+    }
+
+    async fn remove_control_node(
+        &self,
+        _: Request<fleetring_proto::v1::RemoveControlNodeRequest>,
+    ) -> Result<Response<fleetring_proto::v1::ControlGroup>, Status> {
+        Err(Status::unimplemented("stub"))
+    }
+
+    async fn describe_control_group(
+        &self,
+        _: Request<fleetring_proto::v1::DescribeControlGroupRequest>,
+    ) -> Result<Response<fleetring_proto::v1::ControlGroup>, Status> {
+        Err(Status::unimplemented("stub"))
+    }
 }
 
 /// Acknowledges every batch with its end position.

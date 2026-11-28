@@ -38,6 +38,8 @@ use crate::support::Tls;
 mod client;
 #[path = "control/fixtures.rs"]
 mod fixtures;
+#[path = "control/group.rs"]
+mod group;
 #[path = "control/raft_network.rs"]
 mod raft_network;
 #[path = "control/store.rs"]
@@ -758,6 +760,34 @@ impl Control for Redirecting {
         &self,
         _: Request<fleetring_proto::v1::ListDelegationsRequest>,
     ) -> Result<Response<fleetring_proto::v1::ListDelegationsResponse>, Status> {
+        self.redirect()
+    }
+
+    async fn add_control_node(
+        &self,
+        _: Request<fleetring_proto::v1::AddControlNodeRequest>,
+    ) -> Result<Response<fleetring_proto::v1::ControlGroup>, Status> {
+        self.redirect()
+    }
+
+    async fn set_control_voters(
+        &self,
+        _: Request<fleetring_proto::v1::SetControlVotersRequest>,
+    ) -> Result<Response<fleetring_proto::v1::ControlGroup>, Status> {
+        self.redirect()
+    }
+
+    async fn remove_control_node(
+        &self,
+        _: Request<fleetring_proto::v1::RemoveControlNodeRequest>,
+    ) -> Result<Response<fleetring_proto::v1::ControlGroup>, Status> {
+        self.redirect()
+    }
+
+    async fn describe_control_group(
+        &self,
+        _: Request<fleetring_proto::v1::DescribeControlGroupRequest>,
+    ) -> Result<Response<fleetring_proto::v1::ControlGroup>, Status> {
         self.redirect()
     }
 }
@@ -4330,6 +4360,34 @@ impl Control for Publishing {
         &self,
         _: Request<fleetring_proto::v1::ListDelegationsRequest>,
     ) -> Result<Response<fleetring_proto::v1::ListDelegationsResponse>, Status> {
+        unimplemented_stub()
+    }
+
+    async fn add_control_node(
+        &self,
+        _: Request<fleetring_proto::v1::AddControlNodeRequest>,
+    ) -> Result<Response<fleetring_proto::v1::ControlGroup>, Status> {
+        unimplemented_stub()
+    }
+
+    async fn set_control_voters(
+        &self,
+        _: Request<fleetring_proto::v1::SetControlVotersRequest>,
+    ) -> Result<Response<fleetring_proto::v1::ControlGroup>, Status> {
+        unimplemented_stub()
+    }
+
+    async fn remove_control_node(
+        &self,
+        _: Request<fleetring_proto::v1::RemoveControlNodeRequest>,
+    ) -> Result<Response<fleetring_proto::v1::ControlGroup>, Status> {
+        unimplemented_stub()
+    }
+
+    async fn describe_control_group(
+        &self,
+        _: Request<fleetring_proto::v1::DescribeControlGroupRequest>,
+    ) -> Result<Response<fleetring_proto::v1::ControlGroup>, Status> {
         unimplemented_stub()
     }
 }

@@ -51,7 +51,7 @@ pub(crate) use format1::file_format;
 pub use format1::{LogError, LogIndex, Recovered};
 pub use node::{
     Bootstrap, Committed, ControlGroup, ControlHandle, ControlNode, ControlOptions, GroupError,
-    GroupMember, OpenError, RecoverySummary, StorageIo, SubmitError,
+    GroupMember, GroupStatus, MAX_VOTERS, OpenError, RecoverySummary, StorageIo, SubmitError,
 };
 pub use raft::Readiness;
 pub use service::{

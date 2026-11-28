@@ -82,6 +82,10 @@ enum ReplicaRole {
 // call that fails its binding is refused with PERMISSION_DENIED and `fleetring-binding`
 // metadata naming the binding. `fleetringd::auth::RPCS` holds the same table, and tests keep
 // the two equal; a request for an RPC the table doesn't list is refused.
+//
+// Every `Control` RPC is answered by the control group's leader (ADR-0035, ADR-0040). A follower
+// refuses each call with UNAVAILABLE and `fleetring-leader` metadata naming the leader's address,
+// or with UNAVAILABLE alone while it knows no leader; a client sends the call again to the leader.
 
 service Control {
   // Scope: node.
@@ -199,6 +203,63 @@ service Control {
   // them answers UNIMPLEMENTED, and the node keeps its copy.
   // Scope: fleet.
   rpc ListTombstones(ListTombstonesRequest) returns (ListTombstonesResponse);
+  // Adds a node to the control group as a learner, and answers once it has caught up with the
+  // leader's log (ADR-0035 point 11). The leader first probes the node through `Raft.Probe` and
+  // checks its certificate, and refuses, with FAILED_PRECONDITION, a node whose ID or
+  // certificate names another node, that holds Raft state, runs a release outside the window or
+  // without an enabled fleet feature, starts from another genesis configuration, or runs no
+  // control group (ADR-0040 point 4). A dev mode leader refuses an address that isn't loopback.
+  // Scope: fleet.
+  rpc AddControlNode(AddControlNodeRequest) returns (ControlGroup);
+  // Makes exactly the named nodes the control group's voters, through joint consensus; a voter
+  // left out stays a learner. Refused with INVALID_ARGUMENT for an even count or more than seven,
+  // and with FAILED_PRECONDITION for a node that isn't a caught-up member that has reported its
+  // software this term.
+  // Scope: fleet.
+  rpc SetControlVoters(SetControlVotersRequest) returns (ControlGroup);
+  // Removes a learner from the control group; a voter leaves the voters first, with
+  // `SetControlVoters`. A removed node's Raft calls are refused from then on.
+  // Scope: fleet.
+  rpc RemoveControlNode(RemoveControlNodeRequest) returns (ControlGroup);
+  // The control group's voters and learners, its Raft term, its committed index, and whether its
+  // membership is joint, read linearizably on the leader.
+  // Scope: fleet.
+  rpc DescribeControlGroup(DescribeControlGroupRequest) returns (ControlGroup);
+}
+
+message AddControlNodeRequest {
+  // The node's ID, as its `[node] id` and its certificate name it.
+  string node_id = 1;
+  // The address the group's members dial it at, `host:port`.
+  string address = 2;
+}
+
+message SetControlVotersRequest {
+  // The node IDs of every voter the group should have, each a member already.
+  repeated string voters = 1;
+}
+
+message RemoveControlNodeRequest {
+  string node_id = 1;
+}
+
+message DescribeControlGroupRequest {}
+
+// The control group as a control node knows it: the leader's after a read round for
+// `DescribeControlGroup`, and the answering node's own view after a change, which may have handed
+// its leadership over.
+message ControlGroup {
+  // Every voter and learner, in Raft ID order.
+  repeated ControlNode nodes = 1;
+  // The control group's Raft term.
+  uint64 term = 2;
+  // The index of the last log entry the group has committed.
+  uint64 committed_index = 3;
+  // The leader's node ID; empty while the answering node knows none.
+  string leader = 4;
+  // A change of voters began and hasn't finished, so every change needs both configurations'
+  // quorums until another `SetControlVoters` finishes it.
+  bool joint = 5;
 }
 
 message ListTombstonesRequest {

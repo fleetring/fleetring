@@ -240,6 +240,67 @@ pub struct ReplicaInfo {
     pub position: Option<Position>,
 }
 
+/// The control group as its leader knows it (ADR-0040), as [`Client::control_group`] reports
+/// it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ControlGroupView {
+    /// Every voter and learner, in the leader's order.
+    pub members: Vec<ControlMember>,
+    /// The control group's Raft term.
+    pub term: u64,
+    /// The index of the last entry the group has committed.
+    pub committed_index: u64,
+    /// Whether a change of voters began and hasn't finished; another `set-voters` finishes it.
+    pub joint: bool,
+}
+
+/// A voter or learner of the control group.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ControlMember {
+    /// The node's ID.
+    pub node: String,
+    /// The address the group's members and data nodes dial, `host:port`.
+    pub address: String,
+    /// Whether it votes, rather than learns.
+    pub voter: bool,
+    /// Whether it leads the control group.
+    pub leader: bool,
+    /// The last log index the leader knows it holds.
+    pub matched_index: u64,
+    /// The software the leader last heard it report, if any.
+    pub software: Option<fleetring_control::Software>,
+}
+
+impl ControlGroupView {
+    fn from_proto(group: proto::ControlGroup) -> Result<Self, Status> {
+        let members = group
+            .nodes
+            .into_iter()
+            .map(|node| {
+                Ok(ControlMember {
+                    software: node
+                        .software
+                        .map(crate::software::software_from_proto)
+                        .transpose()?,
+                    node: node.node_id,
+                    address: node.address,
+                    voter: node.voter,
+                    leader: node.leader,
+                    matched_index: node.matched_index,
+                })
+            })
+            .collect::<Result<Vec<_>, Status>>()?;
+        Ok(Self {
+            members,
+            term: group.term,
+            committed_index: group.committed_index,
+            joint: group.joint,
+        })
+    }
+}
+
 /// What one data node knows on its own, as [`Client::node_status`] reports it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
@@ -1083,6 +1144,71 @@ impl Client {
             })
             .await?;
         Ok(Epoch::new(response.membership_epoch))
+    }
+
+    /// Reads the control group from its leader: every voter and learner, the term, and the
+    /// committed index.
+    ///
+    /// # Errors
+    ///
+    /// The status of the last attempt; a control node that predates the control group refuses
+    /// the call.
+    pub async fn control_group(&self) -> Result<ControlGroupView, Status> {
+        ControlGroupView::from_proto(self.control.describe_control_group().await?)
+    }
+
+    /// Adds `node`, which serves at `address`, to the control group as a learner, and returns the
+    /// group once it has caught up with the leader's log (ADR-0035 point 11).
+    ///
+    /// # Errors
+    ///
+    /// `FAILED_PRECONDITION` for a node the leader refuses, such as one with Raft state or
+    /// outside the release window, or the status of the failed control call.
+    pub async fn add_control_node(
+        &self,
+        node: &NodeId,
+        address: &str,
+    ) -> Result<ControlGroupView, Status> {
+        let group = self
+            .control
+            .add_control_node(proto::AddControlNodeRequest {
+                node_id: node.to_string(),
+                address: address.to_owned(),
+            })
+            .await?;
+        ControlGroupView::from_proto(group)
+    }
+
+    /// Makes exactly `voters` the control group's voters, and returns the group after.
+    ///
+    /// # Errors
+    ///
+    /// `INVALID_ARGUMENT` for an even count or more than seven, `FAILED_PRECONDITION` for a node
+    /// that isn't a caught-up member, or the status of the failed control call.
+    pub async fn set_control_voters(&self, voters: &[NodeId]) -> Result<ControlGroupView, Status> {
+        let group = self
+            .control
+            .set_control_voters(proto::SetControlVotersRequest {
+                voters: voters.iter().map(ToString::to_string).collect(),
+            })
+            .await?;
+        ControlGroupView::from_proto(group)
+    }
+
+    /// Removes the learner `node` from the control group, and returns the group after.
+    ///
+    /// # Errors
+    ///
+    /// `FAILED_PRECONDITION` for a voter or a node that isn't a member, or the status of the
+    /// failed control call.
+    pub async fn remove_control_node(&self, node: &NodeId) -> Result<ControlGroupView, Status> {
+        let group = self
+            .control
+            .remove_control_node(proto::RemoveControlNodeRequest {
+                node_id: node.to_string(),
+            })
+            .await?;
+        ControlGroupView::from_proto(group)
     }
 
     /// Clears `node`'s draining mark, so that it may take leases again without a restart.

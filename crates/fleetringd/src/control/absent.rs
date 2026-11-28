@@ -3,17 +3,18 @@
 
 use fleetring_proto::v1::control_server::Control;
 use fleetring_proto::v1::{
-    AcquireLeaseRequest, ChangeDurabilityRequest, ChangeDurabilityResponse,
-    CompletePromotionRequest, CompletePromotionResponse, CreateDatabaseRequest,
+    AcquireLeaseRequest, AddControlNodeRequest, ChangeDurabilityRequest, ChangeDurabilityResponse,
+    CompletePromotionRequest, CompletePromotionResponse, ControlGroup, CreateDatabaseRequest,
     CreateDatabaseResponse, CreateDatabaseWithMetadataRequest, DelegateTokenRequest,
-    DelegateTokenResponse, DrainRequest, DrainResponse, DropDatabaseRequest, DropDatabaseResponse,
-    ForkDatabaseRequest, ForkOperationStatus, GetForkOperationRequest, HeartbeatRequest,
-    HeartbeatResponse, JoinRequest, JoinResponse, LeaseResponse, LeaveRequest, LeaveResponse,
-    ListDatabasesRequest, ListDatabasesResponse, ListDelegationsRequest, ListDelegationsResponse,
-    LocateRequest, LocateResponse, PromotionResponse, RecordFencedRequest, RecordFencedResponse,
-    RenewLeaseRequest, RevokeTokenRequest, RevokeTokenResponse, StartPromotionRequest,
-    TransferLeaseRequest, UndrainRequest, UndrainResponse, UpdateDatabaseRequest,
-    UpdateDatabaseResponse, WatchMembershipRequest,
+    DelegateTokenResponse, DescribeControlGroupRequest, DrainRequest, DrainResponse,
+    DropDatabaseRequest, DropDatabaseResponse, ForkDatabaseRequest, ForkOperationStatus,
+    GetForkOperationRequest, HeartbeatRequest, HeartbeatResponse, JoinRequest, JoinResponse,
+    LeaseResponse, LeaveRequest, LeaveResponse, ListDatabasesRequest, ListDatabasesResponse,
+    ListDelegationsRequest, ListDelegationsResponse, LocateRequest, LocateResponse,
+    PromotionResponse, RecordFencedRequest, RecordFencedResponse, RemoveControlNodeRequest,
+    RenewLeaseRequest, RevokeTokenRequest, RevokeTokenResponse, SetControlVotersRequest,
+    StartPromotionRequest, TransferLeaseRequest, UndrainRequest, UndrainResponse,
+    UpdateDatabaseRequest, UpdateDatabaseResponse, WatchMembershipRequest,
 };
 use tonic::{Request, Response, Status};
 
@@ -207,6 +208,34 @@ impl Control for NoControl {
         &self,
         _: Request<ListDelegationsRequest>,
     ) -> Result<Response<ListDelegationsResponse>, Status> {
+        self.refuse()
+    }
+
+    async fn add_control_node(
+        &self,
+        _: Request<AddControlNodeRequest>,
+    ) -> Result<Response<ControlGroup>, Status> {
+        self.refuse()
+    }
+
+    async fn set_control_voters(
+        &self,
+        _: Request<SetControlVotersRequest>,
+    ) -> Result<Response<ControlGroup>, Status> {
+        self.refuse()
+    }
+
+    async fn remove_control_node(
+        &self,
+        _: Request<RemoveControlNodeRequest>,
+    ) -> Result<Response<ControlGroup>, Status> {
+        self.refuse()
+    }
+
+    async fn describe_control_group(
+        &self,
+        _: Request<DescribeControlGroupRequest>,
+    ) -> Result<Response<ControlGroup>, Status> {
         self.refuse()
     }
 }
