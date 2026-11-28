@@ -151,6 +151,8 @@ const _: () = {
     assert_debug_send_sync::<control::raft::codec::InstallSnapshotChunk>();
     assert_debug_send_sync::<control::raft::codec::ProbeReply>();
     assert_debug_send_sync::<control::raft::codec::SnapshotAssembly>();
+    assert_debug_send_sync::<control::raft::codec::TransferLeaderReply>();
+    assert_debug_send_sync::<control::raft::codec::TransferLeaderWire>();
     assert_debug_send_sync::<control::ControlService>();
     assert_debug_send_sync::<control::LogError>();
     assert_debug_send_sync::<control::NoControl>();

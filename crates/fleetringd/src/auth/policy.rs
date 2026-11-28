@@ -376,6 +376,11 @@ pub const RPCS: &[Rpc] = &[
         Requirement::Node,
         Binding::ControlPeer,
     ),
+    rpc(
+        "/fleetring.v1.Raft/TransferLeader",
+        Requirement::Node,
+        Binding::ControlPeer,
+    ),
     // Database.
     rpc(
         "/fleetring.v1.Database/Execute",

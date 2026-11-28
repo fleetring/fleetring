@@ -537,6 +537,11 @@ impl Daemon {
             }
             None => None,
         };
+        // A leader hands its leadership to another voter while the server still answers, so the
+        // new leader's first messages reach it and clients get redirected (ADR-0040 point 5).
+        if let Some(control) = &self.control {
+            control.node.hand_over().await;
+        }
         // Stop accepting calls, then stop the control writer, which also ends membership streams
         // so the server can finish.
         let _server_gone = self.server.stop.send(());

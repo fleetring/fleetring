@@ -22,7 +22,10 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use fleetring_control::{ControlConfig, Software};
 use openraft::EntryPayload;
 use openraft::impls::leader_id_adv::LeaderId;
-use openraft::raft::{AppendError, AppendResult, ConflictHint, SnapshotResponse};
+use openraft::raft::{
+    AppendError, AppendResult, ConflictHint, SnapshotResponse, TransferLeaderError,
+    TransferLeaderRequest, TransferLeaderResponse,
+};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::value::RawValue;
 
@@ -775,6 +778,96 @@ impl From<&SnapshotResponse<ControlTypes>> for InstallSnapshotReply {
 impl From<InstallSnapshotReply> for SnapshotResponse<ControlTypes> {
     fn from(wire: InstallSnapshotReply) -> Self {
         Self::new(Vote::from(wire.vote))
+    }
+}
+
+/// `TransferLeader`: a leader that hands leadership over asks a voter to take it once the voter's
+/// log holds the leader's (ADR-0040 point 5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TransferLeaderWire {
+    /// The vote of the leader that hands leadership over.
+    pub from_leader: VoteWire,
+    /// The voter to take it.
+    pub to: HexId,
+    /// The leader's last log ID, which the voter must hold before it takes over.
+    pub last_log_id: Option<LogIdWire>,
+}
+
+impl From<&TransferLeaderRequest<ControlTypes>> for TransferLeaderWire {
+    fn from(request: &TransferLeaderRequest<ControlTypes>) -> Self {
+        Self {
+            from_leader: VoteWire::from(request.from_leader()),
+            to: HexId(*request.to_node_id()),
+            last_log_id: wire_log_id(request.last_log_id()),
+        }
+    }
+}
+
+impl From<TransferLeaderWire> for TransferLeaderRequest<ControlTypes> {
+    fn from(wire: TransferLeaderWire) -> Self {
+        Self::new(
+            Vote::from(wire.from_leader),
+            wire.to.0,
+            wire.last_log_id.map(LogId::from),
+        )
+    }
+}
+
+/// The reply to `TransferLeader`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "result", rename_all = "snake_case")]
+pub enum TransferLeaderReply {
+    /// The receiver took the request: it resets its leader lease, and the target campaigns.
+    Accepted,
+    /// The target saw another vote than the request's before it could take over.
+    VoteChanged {
+        /// The request's vote.
+        expected: VoteWire,
+        /// The vote the target holds.
+        actual: VoteWire,
+    },
+    /// The target's log doesn't yet hold the leader's last entry.
+    LogNotFlushed {
+        /// The leader's last log ID.
+        expected: Option<LogIdWire>,
+        /// The target's last log ID.
+        actual: Option<LogIdWire>,
+    },
+}
+
+impl From<&TransferLeaderResponse<ControlTypes>> for TransferLeaderReply {
+    fn from(response: &TransferLeaderResponse<ControlTypes>) -> Self {
+        match response {
+            Ok(()) => Self::Accepted,
+            Err(TransferLeaderError::VoteChanged { expected, actual }) => Self::VoteChanged {
+                expected: VoteWire::from(expected),
+                actual: VoteWire::from(actual),
+            },
+            Err(TransferLeaderError::LogNotFlushed { expected, actual }) => Self::LogNotFlushed {
+                expected: wire_log_id(expected.as_ref()),
+                actual: wire_log_id(actual.as_ref()),
+            },
+        }
+    }
+}
+
+impl From<TransferLeaderReply> for TransferLeaderResponse<ControlTypes> {
+    fn from(wire: TransferLeaderReply) -> Self {
+        match wire {
+            TransferLeaderReply::Accepted => Ok(()),
+            TransferLeaderReply::VoteChanged { expected, actual } => {
+                Err(TransferLeaderError::VoteChanged {
+                    expected: Vote::from(expected),
+                    actual: Vote::from(actual),
+                })
+            }
+            TransferLeaderReply::LogNotFlushed { expected, actual } => {
+                Err(TransferLeaderError::LogNotFlushed {
+                    expected: expected.map(LogId::from),
+                    actual: actual.map(LogId::from),
+                })
+            }
+        }
     }
 }
 

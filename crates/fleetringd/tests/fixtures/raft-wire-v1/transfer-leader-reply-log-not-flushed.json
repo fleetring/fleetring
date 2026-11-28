@@ -1,0 +1,9 @@
+{
+  "result": "log_not_flushed",
+  "expected": {
+    "term": 3,
+    "node": "d733a26dd4b49b94",
+    "index": 43
+  },
+  "actual": null
+}

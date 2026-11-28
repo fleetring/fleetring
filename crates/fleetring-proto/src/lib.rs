@@ -31,7 +31,8 @@ use v1::ProtocolVersion;
 /// plane writes, and the principal fields of `RevokeToken`; `Placement.placed_replicas`, and
 /// `replicas_caught_up` in heartbeats, for membership changes that hand replica sets over on
 /// joint quorums (ADR-0031, amendment 2); and `ReplicateOpen.epoch_start_chain` (FR-044).
-/// Minor 4 adds the control group (ADR-0040 point 11): the `Raft` service with `Probe`,
+/// Minor 4 adds the control group (ADR-0040 point 11): the `Raft` service with `Probe` and
+/// `TransferLeader`,
 /// `RaftPayload`, `ControlNode`, `control_nodes` in `JoinResponse` and `HeartbeatResponse`, and
 /// the group's calls `AddControlNode`, `SetControlVoters`, `RemoveControlNode`, and
 /// `DescribeControlGroup`, with `ControlGroup`.

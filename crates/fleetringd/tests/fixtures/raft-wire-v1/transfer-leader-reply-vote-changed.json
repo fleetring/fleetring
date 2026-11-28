@@ -1,0 +1,13 @@
+{
+  "result": "vote_changed",
+  "expected": {
+    "term": 3,
+    "node": "d733a26dd4b49b94",
+    "committed": true
+  },
+  "actual": {
+    "term": 4,
+    "node": "7ffffffffffffffe",
+    "committed": false
+  }
+}

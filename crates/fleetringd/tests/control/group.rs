@@ -11,7 +11,7 @@ use fleetring_control::{Action, Feature, Member};
 use fleetring_proto::v1::{
     AddControlNodeRequest, ForkDatabaseRequest, GetForkOperationRequest, LeaveRequest,
     ListDatabasesRequest, ListDelegationsRequest, LocateRequest, RemoveControlNodeRequest,
-    SetControlVotersRequest,
+    SetControlVotersRequest, WatchMembershipRequest,
 };
 use fleetringd::control::{ControlClient, ControlOptions, ControlService};
 use fleetringd::dev::DevMode;
@@ -416,5 +416,163 @@ async fn a_voters_own_leave_is_not_refused() -> TestResult {
     .await?;
     assert!(handle(&c1).group().contains("c1"));
     stop([c1]).await;
+    Ok(())
+}
+
+/// A membership watch on the leader ends, with `UNAVAILABLE` and a redirect to the new leader,
+/// once its node hands its leadership over, so the watcher opens it again there (ADR-0035
+/// point 6).
+#[tokio::test]
+async fn watch_membership_ends_when_its_node_stops_leading() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let [c1, c2, c3] = three_plaintext(dir.path()).await?;
+    let client = crate::client(c1.listen_address());
+    let mut watch = client
+        .watch_membership(WatchMembershipRequest { after_epoch: 0 })
+        .await?;
+    let leader = handle(&c1).hand_over().await.ok_or("nobody took over")?;
+    let ended = tokio::time::timeout(SETTLE, watch.message())
+        .await?
+        .expect_err("the watch ends with the redirect");
+    assert_eq!(ended.code(), Code::Unavailable, "{ended:?}");
+    assert_eq!(leader_hint(&ended), Some(leader.address), "{ended:?}");
+    assert!(
+        tokio::time::timeout(SETTLE, watch.message())
+            .await?
+            .is_ok_and(|next| next.is_none()),
+        "nothing follows the redirect"
+    );
+    stop([c1, c2, c3]).await;
+    Ok(())
+}
+
+/// A leader that stops gracefully hands its leadership to another voter first (ADR-0040 point
+/// 5): with election timeouts of 2.5 s, another node is ready to lead well before any election
+/// could have chosen one, and it holds what the old leader acknowledged.
+#[tokio::test]
+async fn a_leader_hands_over_before_it_stops() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let tls = Tls::create(dir.path())?;
+    let timings = "election_timeout_ms = 2500";
+    let c1 = start(dir.path(), &tls, "c1", "new", timings, None).await?;
+    let c2 = start(dir.path(), &tls, "c2", "join", timings, None).await?;
+    let c3 = start(dir.path(), &tls, "c3", "join", timings, None).await?;
+    add(&c1, &[("c2", &c2), ("c3", &c3)]).await?;
+    handle(&c1).set_voters(&["c1", "c2", "c3"]).await?;
+    handle(&c1)
+        .submit(Action::Join {
+            member: Member::new("d1".parse()?).with_software(fleetringd::software::running()),
+        })
+        .await?;
+    let started = tokio::time::Instant::now();
+    let took_over = async {
+        loop {
+            if [&c2, &c3]
+                .iter()
+                .any(|daemon| handle(daemon).leadership().is_ready())
+            {
+                return started.elapsed();
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    };
+    let (elapsed, ()) = tokio::join!(took_over, stop([c1]));
+    assert!(
+        elapsed < Duration::from_millis(2_000),
+        "another voter led only after {elapsed:?}"
+    );
+    let leader = if handle(&c2).leadership().is_ready() {
+        &c2
+    } else {
+        &c3
+    };
+    assert!(handle(leader).state().member(&"d1".parse()?).is_some());
+    stop([c2, c3]).await;
+    Ok(())
+}
+
+/// A leader that `set-voters` leaves out of the voters hands its leadership to one that votes,
+/// rather than lead on as a learner, as openraft 0.10.1 would let it.
+#[tokio::test]
+async fn a_leader_left_out_of_the_voters_hands_over() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let [c1, c2, c3] = three_plaintext(dir.path()).await?;
+    handle(&c1).set_voters(&["c2"]).await?;
+    until("c2 leads", || handle(&c2).leadership().is_ready()).await?;
+    assert!(!handle(&c1).leadership().is_ready());
+    let group = handle(&c2).group();
+    assert_eq!(group.voters().len(), 1, "{group:?}");
+    assert_eq!(group.learners().len(), 2, "{group:?}");
+    stop([c1, c2, c3]).await;
+    Ok(())
+}
+
+/// `SetControlVoters` that leaves the leader out is answered by the leader that made the change,
+/// with the group after it, although the change handed its leadership over: a plain client, which
+/// follows no redirect, gets the answer, so a following one never sends the change again.
+#[tokio::test]
+async fn set_voters_that_drops_the_leader_answers_with_the_group() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let [c1, c2, c3] = three_plaintext(dir.path()).await?;
+    let mut raw = fleetring_proto::v1::control_client::ControlClient::connect(format!(
+        "http://{}",
+        c1.listen_address()
+    ))
+    .await?;
+    let group = raw
+        .set_control_voters(SetControlVotersRequest {
+            voters: vec!["c2".into()],
+        })
+        .await?
+        .into_inner();
+    let voters: Vec<&str> = group
+        .nodes
+        .iter()
+        .filter(|node| node.voter)
+        .map(|node| node.node_id.as_str())
+        .collect();
+    assert_eq!(voters, ["c2"], "{group:?}");
+    assert!(!group.joint, "{group:?}");
+    until("c2 leads", || handle(&c2).leadership().is_ready()).await?;
+    stop([c1, c2, c3]).await;
+    Ok(())
+}
+
+/// A leader hands over only to a voter it heard from within an election timeout: with `c2`
+/// down, `c3` takes over.
+#[tokio::test]
+async fn a_leader_hands_over_to_a_voter_that_answers() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let [c1, c2, c3] = three_plaintext(dir.path()).await?;
+    stop([c2]).await;
+    // Past one election timeout, `c2`'s last answer is stale.
+    tokio::time::sleep(Duration::from_millis(1_500)).await;
+    let leader = handle(&c1).hand_over().await.ok_or("nobody took over")?;
+    assert_eq!(leader.node_id, "c3");
+    stop([c1, c3]).await;
+    Ok(())
+}
+
+/// A control daemon that stopped has closed its control log by the time it returns, so its data
+/// directory can be removed at once, which Windows refuses while a file in it is open. A data
+/// node's membership watch is open, as in a fleet, and ends as the control node stops. The last
+/// connection to a WAL-mode SQLite file deletes its `-wal` file as it closes.
+#[tokio::test]
+async fn a_stopped_control_daemon_has_closed_its_control_log() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let tls = Tls::create(dir.path())?;
+    let c1 = start(dir.path(), &tls, "c1", "new", "", None).await?;
+    let wal = dir.path().join("c1").join("control.db-wal");
+    assert!(wal.exists(), "the control log is open in WAL mode");
+    let watcher = tls.node_network("d1")?.control_client(address(&c1));
+    let _watch = watcher
+        .watch_membership(WatchMembershipRequest { after_epoch: 0 })
+        .await?;
+    c1.run_until(async {}).await;
+    assert!(
+        !wal.exists(),
+        "the control log is still open after the daemon stopped"
+    );
+    std::fs::remove_dir_all(dir.path().join("c1"))?;
     Ok(())
 }
