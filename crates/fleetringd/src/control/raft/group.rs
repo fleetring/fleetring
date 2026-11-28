@@ -17,7 +17,7 @@
 //! - **Clocks are watched, never used.** The largest offset between a member's clock and this
 //!   node's is exported, with a warning at most once a minute above the failover margin.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -251,6 +251,18 @@ impl GroupSoftware {
             .heard
             .get(&member)
             .map(|heard| heard.software.clone())
+    }
+
+    /// The members this node has heard from within the staleness bound, one shortest election
+    /// timeout: those it can count on to answer now, whatever their software.
+    pub(crate) fn heard_recently(&self) -> BTreeSet<RaftId> {
+        let stale_after = self.shared.stale_after;
+        self.lock()
+            .heard
+            .iter()
+            .filter(|(_, heard)| heard.at.elapsed() <= stale_after)
+            .map(|(id, _)| *id)
+            .collect()
     }
 
     /// Every voter and learner with its report, in node ID order, named by its node ID; a

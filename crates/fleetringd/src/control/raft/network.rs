@@ -19,7 +19,8 @@ use openraft::OptionalSend;
 use openraft::errors::{NetworkError, RPCError, ReplicationClosed, StreamingError, Unreachable};
 use openraft::network::{RPCOption, RaftNetworkFactory, RaftNetworkV2};
 use openraft::raft::{
-    AppendEntriesRequest, AppendResult, SnapshotResponse, VoteRequest, VoteResponse,
+    AppendEntriesRequest, AppendResult, SnapshotResponse, TransferLeaderRequest,
+    TransferLeaderResponse, VoteRequest, VoteResponse,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -30,7 +31,7 @@ use crate::auth::{Binding, refused_binding};
 use crate::clock::Clock;
 use crate::control::raft::codec::{
     AppendEntries, AppendEntriesReply, InstallSnapshotReply, ProbeReply, SNAPSHOT_CHUNK_BYTES,
-    VoteReply, VoteRequestWire, snapshot_chunks,
+    TransferLeaderReply, TransferLeaderWire, VoteReply, VoteRequestWire, snapshot_chunks,
 };
 use crate::control::raft::group::GroupSoftware;
 use crate::control::raft::state_machine::{ControlSnapshotOf, SnapshotData};
@@ -218,6 +219,7 @@ enum Method {
     AppendEntries,
     Vote,
     InstallSnapshot,
+    TransferLeader,
 }
 
 /// A connection to one member of the control group.
@@ -266,6 +268,7 @@ impl PeerConnection {
                 Method::AppendEntries => client.append_entries(payload).await,
                 Method::Vote => client.vote(payload).await,
                 Method::InstallSnapshot => client.install_snapshot(payload).await,
+                Method::TransferLeader => client.transfer_leader(payload).await,
             }
         };
         let answered = tokio::time::timeout(limit, call).await;
@@ -333,6 +336,21 @@ impl RaftNetworkV2<ControlTypes> for PeerConnection {
             )
             .await?;
         Ok(VoteResponse::from(reply))
+    }
+
+    async fn transfer_leader(
+        &mut self,
+        rpc: TransferLeaderRequest<ControlTypes>,
+        option: RPCOption,
+    ) -> Result<TransferLeaderResponse<ControlTypes>, RPCError<ControlTypes>> {
+        let reply: TransferLeaderReply = self
+            .call(
+                Method::TransferLeader,
+                &TransferLeaderWire::from(&rpc),
+                option.hard_ttl(),
+            )
+            .await?;
+        Ok(TransferLeaderResponse::from(reply))
     }
 
     async fn full_snapshot(

@@ -36,7 +36,7 @@ use fleetring_proto::v1::{
     UpdateDatabaseRequest, UpdateDatabaseResponse, WatchMembershipRequest,
 };
 use fleetring_proto::{PROTOCOL_VERSION, check_protocol};
-use tokio_stream::wrappers::WatchStream;
+use tokio_stream::wrappers::{ReceiverStream, WatchStream};
 use tokio_stream::{Stream, StreamExt};
 use tonic::metadata::MetadataValue;
 use tonic::{Request, Response, Status};
@@ -1234,6 +1234,50 @@ pub fn missing_database(status: &Status) -> Option<&str> {
     status.metadata().get(MISSING_DATABASE_KEY)?.to_str().ok()
 }
 
+/// Waits until this node no longer leads under `opened`, and returns the status a membership
+/// watch opened under it ends with: a redirect to the new leader when this node knows it. A node
+/// that knows no leader yet, as just after it handed its leadership over, waits up to `wait`, one
+/// election timeout, for one to be known (ADR-0035 point 6); without one it ends with
+/// `UNAVAILABLE` alone. A node that leads again, in a later term, ends the watch at once.
+async fn leadership_lost(
+    mut leadership: tokio::sync::watch::Receiver<Readiness>,
+    opened: crate::control::raft::LeaderRef,
+    wait: std::time::Duration,
+) -> Status {
+    let reopen = || Status::unavailable("the control leader changed; open the watch again");
+    loop {
+        let readiness = leadership.borrow_and_update().clone();
+        match readiness {
+            Readiness::Ready { leader } if leader == opened => {}
+            Readiness::Follower {
+                leader: Some(leader),
+            } => return not_leader(&leader.address),
+            Readiness::Follower { leader: None } => {
+                let known = tokio::time::timeout(
+                    wait,
+                    leadership.wait_for(|readiness| {
+                        !matches!(readiness, Readiness::Follower { leader: None })
+                    }),
+                )
+                .await
+                .ok()
+                .and_then(Result::ok)
+                .map(|readiness| readiness.clone());
+                return match known {
+                    Some(Readiness::Follower {
+                        leader: Some(leader),
+                    }) => not_leader(&leader.address),
+                    Some(_) | None => reopen(),
+                };
+            }
+            Readiness::Ready { .. } | Readiness::CatchingUp { .. } => return reopen(),
+        }
+        if leadership.changed().await.is_err() {
+            return Status::unavailable("the control node stopped; open the watch again");
+        }
+    }
+}
+
 /// The status a submission's error is answered with: a redirect to the leader when this node
 /// knows it, `UNAVAILABLE` while the control group has no ready leader here or the leader
 /// changed, with the leader as a hint when known. A command whose outcome is unknown is
@@ -1824,22 +1868,19 @@ impl Control for ControlService {
             held = Some((epoch, flags, features));
             update
         });
-        let lost = WatchStream::new(self.node.watch_leadership()).filter_map(move |readiness| {
-            match readiness {
-                Readiness::Ready { leader } if leader == opened => None,
-                Readiness::Ready { .. } => Some(Err(Status::unavailable(
-                    "the control leader changed; open the watch again",
-                ))),
-                Readiness::Follower { leader } => {
-                    Some(Err(submit_status(SubmitError::NotLeader {
-                        leader: leader.map(|peer| peer.address),
-                    })))
-                }
-                Readiness::CatchingUp { .. } => {
-                    Some(Err(submit_status(SubmitError::CatchingUp { leader: None })))
-                }
-            }
+        // A task waits for this node to stop leading, and sends the status the watch ends with;
+        // it ends as soon as the watch is dropped.
+        let (lost_sender, lost_receiver) = tokio::sync::mpsc::channel(1);
+        let leadership = self.node.watch_leadership();
+        let wait = self.node.longest_election_timeout();
+        tokio::spawn(async move {
+            let status = tokio::select! {
+                () = lost_sender.closed() => return,
+                status = leadership_lost(leadership, opened, wait) => status,
+            };
+            let _gone = lost_sender.send(Err(status)).await;
         });
+        let lost = ReceiverStream::new(lost_receiver);
         // The first error, the redirect, is the stream's last item.
         let mut ended = false;
         let updates = updates.merge(lost).map_while(move |item| {

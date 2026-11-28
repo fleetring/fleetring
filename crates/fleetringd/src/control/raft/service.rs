@@ -25,7 +25,8 @@ use crate::control::ControlHandle;
 use crate::control::format1::check_state;
 use crate::control::raft::codec::{
     AppendEntries, AppendEntriesReply, AssembledSnapshot, InstallSnapshotChunk,
-    InstallSnapshotReply, ProbeReply, SnapshotAssembly, VoteReply, VoteRequestWire, VoteWire,
+    InstallSnapshotReply, ProbeReply, SnapshotAssembly, TransferLeaderReply, TransferLeaderWire,
+    VoteReply, VoteRequestWire, VoteWire,
 };
 use crate::control::raft::group::GroupSoftware;
 use crate::control::raft::network::{ProbeRequest, heard, payload};
@@ -237,6 +238,22 @@ impl Raft for RaftService {
             .await
             .map_err(|fatal| stopped(&fatal))?;
         self.reply(&InstallSnapshotReply::from(&response))
+    }
+
+    async fn transfer_leader(
+        &self,
+        request: Request<RaftPayload>,
+    ) -> Result<Response<RaftPayload>, Status> {
+        let caller = self.admit(&request, "TransferLeader")?;
+        let wire: TransferLeaderWire = decode(request.get_ref(), "TransferLeader")?;
+        // Only the leader whose vote the request carries hands its leadership over.
+        require_speaker(caller, wire.from_leader.node.0, "TransferLeader")?;
+        let response = self
+            .raft()?
+            .handle_transfer_leader(wire.into())
+            .await
+            .map_err(|fatal| stopped(&fatal))?;
+        self.reply(&TransferLeaderReply::from(&response))
     }
 
     async fn probe(&self, request: Request<RaftPayload>) -> Result<Response<RaftPayload>, Status> {

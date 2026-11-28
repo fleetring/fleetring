@@ -1152,6 +1152,12 @@ service Raft {
   // Scope: node.
   // Binding: control peer.
   rpc Probe(RaftPayload) returns (RaftPayload);
+  // Asks a voter to take over leadership once its log holds the leader's (ADR-0040 point 5): a
+  // leader that shuts down gracefully, or leaves the voters, sends it to the most caught-up
+  // voter, so the hand-over costs no election timeout.
+  // Scope: node.
+  // Binding: control peer.
+  rpc TransferLeader(RaftPayload) returns (RaftPayload);
 }
 
 message RaftPayload {

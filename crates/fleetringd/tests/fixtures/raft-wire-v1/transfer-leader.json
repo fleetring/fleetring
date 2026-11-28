@@ -1,0 +1,13 @@
+{
+  "from_leader": {
+    "term": 3,
+    "node": "d733a26dd4b49b94",
+    "committed": true
+  },
+  "to": "0000000000000002",
+  "last_log_id": {
+    "term": 3,
+    "node": "d733a26dd4b49b94",
+    "index": 43
+  }
+}

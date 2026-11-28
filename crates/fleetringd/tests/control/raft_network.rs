@@ -238,6 +238,13 @@ impl fleetring_proto::v1::raft_server::Raft for Release09 {
     ) -> Result<tonic::Response<RaftPayload>, tonic::Status> {
         Err(unlisted("Probe"))
     }
+
+    async fn transfer_leader(
+        &self,
+        _: tonic::Request<RaftPayload>,
+    ) -> Result<tonic::Response<RaftPayload>, tonic::Status> {
+        Err(unlisted("TransferLeader"))
+    }
 }
 
 /// A plaintext control node, `insecure_plaintext`, for tests whose stubs serve no TLS.
@@ -697,5 +704,50 @@ async fn a_snapshot_larger_than_a_chunk_installs_on_a_learner() -> TestResult {
     })
     .await?;
     stop([c1, c2]).await;
+    Ok(())
+}
+
+/// `TransferLeader` hands leadership over only for the leader whose vote it carries: a member
+/// whose certificate isn't that vote's node is refused, and one that sends its own vote, not the
+/// leader's, changes nothing.
+#[tokio::test]
+async fn transfer_leader_is_the_leaders_alone() -> TestResult {
+    use fleetringd::control::raft::codec::{
+        HexId, TransferLeaderReply, TransferLeaderWire, VoteWire,
+    };
+    use fleetringd::control::raft::raft_id;
+
+    let dir = tempfile::tempdir()?;
+    let tls = Tls::create(dir.path())?;
+    let [c1, c2, c3] = three(dir.path(), &tls, None).await?;
+    let term = handle(&c1).term();
+    let transfer = |from: &str| {
+        let wire = TransferLeaderWire {
+            from_leader: VoteWire {
+                term,
+                node: HexId(raft_id(from)),
+                committed: true,
+            },
+            to: HexId(raft_id("c3")),
+            last_log_id: None,
+        };
+        RaftPayload {
+            json: serde_json::to_vec(&wire).expect("the request encodes"),
+            sender: None,
+            sent_at_ms: 0,
+        }
+    };
+    let mut member = raft_client(tls.node_network("c2")?.channel(&address(&c3))?);
+    let refused = member
+        .transfer_leader(transfer("c1"))
+        .await
+        .expect_err("c2 doesn't speak for c1");
+    assert_eq!(refused.code(), Code::PermissionDenied, "{refused:?}");
+    let answered = member.transfer_leader(transfer("c2")).await?.into_inner();
+    let _reply: TransferLeaderReply = serde_json::from_slice(&answered.json)?;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(leader_of(&c3).as_deref(), Some("c1"));
+    assert!(handle(&c1).leadership().is_ready());
+    stop([c1, c2, c3]).await;
     Ok(())
 }

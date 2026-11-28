@@ -482,6 +482,7 @@ A token is checked when a request arrives, and a stream opened with one (`WatchL
 | `Raft.Vote` | node | control peer |
 | `Raft.InstallSnapshot` | node | control peer |
 | `Raft.Probe` | node | control peer |
+| `Raft.TransferLeader` | node | control peer |
 | `Database.Execute` | write on the database | — |
 | `Database.Query` | read on the database | — |
 | `Database.Schema` | read on the database | — |

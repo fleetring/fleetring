@@ -3,7 +3,10 @@ use std::fs;
 use std::path::PathBuf;
 
 use fleetring_control::{Action, Command, Feature, Release, Timestamp};
-use openraft::raft::{AppendEntriesRequest, VoteRequest, VoteResponse};
+use openraft::raft::{
+    AppendEntriesRequest, TransferLeaderError, TransferLeaderRequest, TransferLeaderResponse,
+    VoteRequest, VoteResponse,
+};
 
 use super::*;
 use crate::control::raft::raft_id;
@@ -234,6 +237,29 @@ fn vectors() -> Vec<Vector> {
                 (pretty(&wire), same && wire == chunk())
             }),
         },
+        vector::<TransferLeaderWire, TransferLeaderRequest<ControlTypes>>(
+            "transfer-leader.json",
+            || {
+                TransferLeaderRequest::new(
+                    committed_vote(3, LEADER),
+                    FOLLOWER,
+                    Some(log_id(3, LEADER, 43)),
+                )
+            },
+        ),
+        transfer_reply_vector("transfer-leader-reply-accepted.json", || Ok(())),
+        transfer_reply_vector("transfer-leader-reply-vote-changed.json", || {
+            Err(TransferLeaderError::VoteChanged {
+                expected: committed_vote(3, LEADER),
+                actual: Vote::new(4, LEARNER),
+            })
+        }),
+        transfer_reply_vector("transfer-leader-reply-log-not-flushed.json", || {
+            Err(TransferLeaderError::LogNotFlushed {
+                expected: Some(log_id(3, LEADER, 43)),
+                actual: None,
+            })
+        }),
         Vector {
             name: "probe-reply.json",
             encode: Box::new(|| pretty(&probe())),
@@ -292,6 +318,26 @@ fn entry_vector(name: &'static str, value: impl Fn() -> Entry + 'static) -> Vect
                     _ => false,
                 };
             (pretty(&EntryWire::from(&decoded)), same)
+        }),
+    }
+}
+
+fn transfer_reply_vector(
+    name: &'static str,
+    value: impl Fn() -> TransferLeaderResponse<ControlTypes> + 'static,
+) -> Vector {
+    let value = std::rc::Rc::new(value);
+    let made = std::rc::Rc::clone(&value);
+    Vector {
+        name,
+        encode: Box::new(move || pretty(&TransferLeaderReply::from(&made()))),
+        round_trip: Box::new(move |text| {
+            let wire: TransferLeaderReply = serde_json::from_str(text).expect("the vector decodes");
+            let decoded = TransferLeaderResponse::<ControlTypes>::from(wire);
+            (
+                pretty(&TransferLeaderReply::from(&decoded)),
+                decoded == value(),
+            )
         }),
     }
 }

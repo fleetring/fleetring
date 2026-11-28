@@ -12,8 +12,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use fleetring_control::fork::ForkLimits;
@@ -24,7 +24,7 @@ use fleetring_control::{
 use openraft::errors::{LinearizableReadError, RaftError};
 use openraft::raft::ReadPolicy;
 use openraft::rt::watch::WatchReceiver;
-use openraft::{EntryPayload, SnapshotPolicy};
+use openraft::{EntryPayload, RaftMetrics, ServerState, SnapshotPolicy};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 
@@ -70,6 +70,14 @@ const DEFAULT_SNAPSHOTS_RETAINED: NonZeroUsize = NonZeroUsize::new(2).expect("2 
 /// snapshot then purges the entries it covers, and the log keeps at most `snapshot_every` plus
 /// `log_keep` entries.
 const PURGE_BATCH: u64 = 256;
+
+/// How often [`ControlNode::shutdown`] looks whether openraft's tasks have let go of the control
+/// log.
+const STORE_CLOSE_POLL: Duration = Duration::from_millis(1);
+
+/// How long [`ControlNode::shutdown`] waits for openraft's tasks to let go of the control log
+/// before it warns and returns: they finish within a storage call once the core has stopped.
+const STORE_CLOSE_LIMIT: Duration = Duration::from_secs(10);
 
 /// The name openraft's configuration gives the control group.
 const GROUP_NAME: &str = "fleetring-control";
@@ -538,6 +546,9 @@ pub struct ControlHandle {
     own: ControlPeer,
     /// The group's network, which probes a node before it is added; shared, since it is large.
     network: Arc<ControlNetwork>,
+    /// How long a leader that hands leadership over waits for another voter to take it: the
+    /// longest election timeout, after which openraft's own transfer gives up and campaigns.
+    hand_over_wait: Duration,
     #[cfg(test)]
     faults: Arc<crate::control::raft::proposer::Faults>,
 }
@@ -1003,6 +1014,11 @@ impl ControlHandle {
             });
         }
         tracing::info!(?voters, "the control group's voters changed");
+        // openraft 0.10.1 lets a leader that is now a learner keep leading; a group whose leader
+        // doesn't vote loses it at the leader's next restart anyway, so it goes now.
+        if !voters.contains(&self.own.node_id.as_str()) {
+            self.hand_over().await;
+        }
         Ok(())
     }
 
@@ -1096,6 +1112,88 @@ impl ControlHandle {
         };
         tracing::info!(node, "a node was removed from the control group");
         Ok(())
+    }
+
+    /// Hands the control group's leadership to the most caught-up of its other voters that this
+    /// node heard from within one election timeout, if this node leads, and waits until another
+    /// node leads, for at most the longest election timeout (ADR-0040 point 5). A leader that
+    /// shuts down gracefully calls it first, so a planned restart of the leader costs no
+    /// election; a voter that is down is never chosen, and with none heard nothing is handed
+    /// over.
+    ///
+    /// openraft's transfer stops this node taking writes, and the voter campaigns once its log
+    /// holds every entry this node's log holds, so nothing this node acknowledged is lost. A node
+    /// that doesn't lead, or leads a group with no other voter, hands nothing over; one whose
+    /// transfer doesn't take within the wait returns anyway, and openraft campaigns again on its
+    /// own.
+    ///
+    /// Returns the leader afterwards, if another node took over.
+    pub async fn hand_over(&self) -> Option<ControlPeer> {
+        let raft = self.raft.as_ref()?;
+        let own = raft_id(&self.own.node_id);
+        let target = {
+            let metrics = raft.metrics();
+            let metrics = metrics.borrow_watched();
+            if metrics.state != ServerState::Leader || metrics.current_leader != Some(own) {
+                return None;
+            }
+            let heard = self.gate.group().heard_recently();
+            let Some(target) = most_caught_up_voter(&metrics, own, &heard) else {
+                tracing::info!(
+                    "no other voter of the control group answered within an election timeout; \
+                     not handing leadership over"
+                );
+                return None;
+            };
+            target
+        };
+        let mut watched = raft.metrics();
+        let handed = async {
+            raft.trigger().transfer_leader(target).await.ok()?;
+            loop {
+                let leader = {
+                    let metrics = watched.borrow_watched();
+                    metrics
+                        .current_leader
+                        .filter(|leader| *leader != own)
+                        .and_then(|leader| {
+                            metrics
+                                .membership_config
+                                .membership()
+                                .get_node(&leader)
+                                .cloned()
+                        })
+                };
+                if leader.is_some() {
+                    return leader;
+                }
+                watched.changed().await.ok()?;
+            }
+        };
+        let started = tokio::time::Instant::now();
+        match tokio::time::timeout(self.hand_over_wait, handed).await {
+            Ok(Some(leader)) => {
+                tracing::info!(
+                    leader = %leader.node_id,
+                    elapsed_ms = started.elapsed().as_millis(),
+                    "handed the control group's leadership over",
+                );
+                Some(leader)
+            }
+            Ok(None) | Err(_) => {
+                tracing::warn!(
+                    wait_ms = self.hand_over_wait.as_millis(),
+                    "no other control node took over leadership; stopping anyway",
+                );
+                None
+            }
+        }
+    }
+
+    /// The control group's longest election timeout: how long a leader change takes at most
+    /// when nothing fails.
+    pub(crate) fn longest_election_timeout(&self) -> Duration {
+        self.hand_over_wait
     }
 
     /// Returns the leader this node knows of, if any: itself or another member.
@@ -1259,6 +1357,31 @@ fn probe_verdict(
     Ok(())
 }
 
+/// The voter other than `own`, among those in `heard`, whose log the leader knows to reach
+/// furthest, the lowest Raft ID among equals; none if there is no such voter or the metrics
+/// aren't a leader's.
+fn most_caught_up_voter(
+    metrics: &RaftMetrics<ControlTypes>,
+    own: RaftId,
+    heard: &BTreeSet<RaftId>,
+) -> Option<RaftId> {
+    let replication = metrics.replication.as_ref()?;
+    metrics
+        .membership_config
+        .membership()
+        .voter_ids()
+        .filter(|id| *id != own && heard.contains(id))
+        .map(|id| {
+            let matched = replication
+                .get(&id)
+                .and_then(|matched| matched.as_ref())
+                .map(|log_id| log_id.index);
+            (matched, std::cmp::Reverse(id))
+        })
+        .max()
+        .map(|(_, std::cmp::Reverse(id))| id)
+}
+
 /// The group error for openraft's refusal of a membership change.
 fn group_error(
     error: RaftError<ControlTypes, openraft::errors::ClientWriteError<ControlTypes>>,
@@ -1281,13 +1404,19 @@ fn group_error(
 pub struct ControlNode {
     handle: ControlHandle,
     recovered: RecoverySummary,
-    #[cfg_attr(not(test), expect(dead_code, reason = "the tests count its appends"))]
     log: RaftLog,
+    /// The control log's store, which [`ControlNode::shutdown`] waits to see closed: openraft
+    /// joins only its core task as it stops, and its state machine worker, snapshot builder, and
+    /// replication streams each still hold the store until they finish.
+    store: Weak<Mutex<ControlStore>>,
     tasks: Vec<JoinHandle<()>>,
     /// Tells the proposer to stop even while it waits for a batch to be answered.
     stopping: watch::Sender<bool>,
     /// What the `Raft` service stamps its replies with.
     clock: Arc<dyn Clock>,
+    /// Whether [`ControlNode::hand_over`] ran, so that shutdown doesn't hand over again once the
+    /// server that would hear the new leader has stopped.
+    handed_over: AtomicBool,
 }
 
 /// What a control node found when it opened its log.
@@ -1382,29 +1511,70 @@ impl ControlNode {
         )
     }
 
+    /// Hands leadership over as [`ControlHandle::hand_over`] does, once: a later
+    /// [`ControlNode::shutdown`] doesn't try again. The daemon calls it while its server still
+    /// answers, so the new leader's messages reach this node.
+    pub async fn hand_over(&self) -> Option<ControlPeer> {
+        self.handed_over.store(true, Ordering::SeqCst);
+        self.handle.hand_over().await
+    }
+
     /// How many appends the node's log storage made, each one transaction with one sync.
     #[cfg(test)]
     pub(crate) fn appends(&self) -> u64 {
         self.log.appends()
     }
 
-    /// Stops the proposer after the commands already submitted, then the control group, and
-    /// closes the log.
+    /// Hands leadership over if this node leads ([`ControlHandle::hand_over`]) and
+    /// [`ControlNode::hand_over`] hasn't run, then stops the proposer after the commands already
+    /// submitted, then the control group, and returns once every task that held the control log
+    /// has let go of it and the log is closed.
     ///
     /// Commands submitted after this fail with [`SubmitError::Stopped`]. State watchers see their
     /// streams end.
     pub async fn shutdown(self) {
-        self.stopping.send_replace(true);
+        let Self {
+            handle,
+            log,
+            store,
+            tasks,
+            stopping,
+            handed_over,
+            ..
+        } = self;
+        if !handed_over.load(Ordering::SeqCst) {
+            handle.hand_over().await;
+        }
+        stopping.send_replace(true);
         let (done, stopped) = oneshot::channel();
-        if self.handle.mailbox.send(Mail::Stop { done }).await.is_ok() {
+        if handle.mailbox.send(Mail::Stop { done }).await.is_ok() {
             // An error means the proposer already exited, which is what shutdown wants.
             let _stopped = stopped.await;
         }
-        if let Some(raft) = &self.handle.raft {
+        if let Some(raft) = &handle.raft {
             let _stopped = raft.shutdown().await;
         }
-        for task in self.tasks {
+        for task in tasks {
             task.abort();
+            // An aborted task's future is dropped when the runtime next polls it.
+            let _aborted = task.await;
+        }
+        drop(log);
+        // openraft's other tasks let go of the store as they see the core gone; the log is
+        // closed, and its files free to remove, only once the last of them has.
+        let closed = async {
+            while store.strong_count() > 0 {
+                tokio::time::sleep(STORE_CLOSE_POLL).await;
+            }
+        };
+        if tokio::time::timeout(STORE_CLOSE_LIMIT, closed)
+            .await
+            .is_err()
+        {
+            tracing::warn!(
+                limit_ms = STORE_CLOSE_LIMIT.as_millis(),
+                "the control log is still open after the control node stopped",
+            );
         }
     }
 }
@@ -1473,6 +1643,7 @@ impl Opening {
             .await?
         };
         let raft_config = options.raft_config().map_err(OpenError::RaftConfig)?;
+        let hand_over_wait = Duration::from_millis(raft_config.election_timeout_max);
         let log = RaftLog::new(Arc::clone(&store), io, metrics.clone());
         let (machine, published) = ControlStateMachine::open(
             Arc::clone(&store),
@@ -1500,13 +1671,16 @@ impl Opening {
                     gate,
                     own,
                     network: Arc::new(control_network),
+                    hand_over_wait,
                     #[cfg(test)]
                     faults: Arc::default(),
                 },
                 recovered: found.summary,
                 log,
+                store: Arc::downgrade(&store),
                 tasks: Vec::new(),
                 stopping: watch::channel(false).0,
+                handed_over: AtomicBool::new(false),
                 clock,
             });
         }
@@ -1607,13 +1781,16 @@ impl Opening {
                 gate,
                 own,
                 network: Arc::new(control_network),
+                hand_over_wait,
                 #[cfg(test)]
                 faults: running.faults,
             },
             recovered,
             log,
+            store: Arc::downgrade(&store),
             tasks: vec![running.task, watcher],
             stopping,
+            handed_over: AtomicBool::new(false),
             clock,
         })
     }
